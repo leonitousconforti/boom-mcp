@@ -1,0 +1,962 @@
+"""The Babamul assistant: a chat panel in Babamul that answers with these tools.
+
+The browser posts the conversation to `{prefix}/chat` with the person's Babamul
+token. This server runs the tool loop against an OpenAI-compatible model and
+streams what happens back as server-sent events. The model key never leaves the
+server, and every tool call runs with the person's own token. It follows
+SkyPortal's assistant (services/assistant/app.py, skyportal/utils/assistant.py).
+
+Tools run in this process, not over loopback HTTP to /mcp: the token reaches
+them through `app.caller`, set inside the task answering one question. That
+needs no knowledge of the address this server is reached at, no Host checks
+and no MCP session per call, and a tool cannot fall back to the server's token.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import time
+import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+
+import anyio
+import httpx
+from mcp.server.mcpserver.exceptions import ToolError
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
+
+from . import summarize as s
+from .app import INSTRUCTIONS, caller, mcp, settings
+from .babamul import USER_AGENT, Babamul, base_url_from_env
+
+log = logging.getLogger("boom_mcp.assistant")
+
+SYSTEM_PROMPT = """You are an assistant inside Babamul, the web app of the BOOM \
+alert broker. You are talking with an astronomer in a chat panel of the app.
+
+Use the tools to look things up rather than guessing; if the tools do not answer \
+the question, say so plainly. Be brief: this is a chat message, not a report. \
+Write object ids in full, exactly as the tools give them, so the app can link them."""
+
+NO_VISION = """Images the tools return, such as cutouts and light-curve plots, \
+are shown to the person in the chat as soon as the tool finishes. You cannot see \
+them yourself, so never describe what they show: say they are in the chat, and \
+what to look for in them. Mention images only when a tool result says it showed \
+one."""
+
+VISION = """Images the tools return, such as cutouts and light-curve plots, are \
+shown to the person in the chat as soon as the tool finishes, and you are given \
+them too. Describe only what you can actually see in them, and mention images \
+only when a tool result says it showed one."""
+
+ANSWER_NOW = "Answer now from what you have, and say what is still unknown."
+
+# What the person reads when something goes wrong. Each says whether asking
+# again can help, because the person cannot tell otherwise.
+UNREACHABLE = "The model is not answering right now. Try again in a minute."
+STALLED = "The model stopped answering partway. Nothing is wrong with what you asked; try again."
+MISCONFIGURED = "The assistant is not set up correctly. Tell the Babamul team."
+REFUSED = (
+    "The model could not take this conversation, maybe because it is too long. "
+    "Start a new chat and try again."
+)
+BROKEN = "Something went wrong while looking that up. Try again."
+OUT_OF_TIME = "I ran out of time working that out. Please ask again, or narrow the question."
+NO_ANSWER = "I could not find an answer to that."
+CUT_SHORT = "\n\n(I ran out of time here, so this answer is cut short.)"
+
+# The part of the answer timeout the tool loop may use. The rest is kept for the
+# final answer, so running out of time still ends in an answer.
+TOOL_SHARE = 0.75
+# How much of a tool result the trace under the answer shows.
+SUMMARY_BUDGET = 300
+# An old tool result shrinks to this when the conversation outgrows the model.
+SHRUNK_RESULT = 2000
+# A status event after this many quiet seconds, so proxies keep the stream open.
+HEARTBEAT = 15.0
+TOKEN_TTL = 300.0
+BAD_TOKEN_TTL = 60.0
+MAX_BODY = 1_000_000
+MAX_MESSAGE_CHARS = 20_000
+
+
+def env_flag(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """An OpenAI-compatible server: base_url ends in /v1."""
+
+    base_url: str
+    model: str = ""
+    api_key: str = field(default="", repr=False)
+
+
+@dataclass
+class Config:
+    llm: Endpoint
+    fallback: Endpoint | None = None
+    vision: bool = False
+    thinking: bool = False
+    max_tool_calls: int = 10
+    answer_timeout: float = 240.0
+    stall_timeout: float = 60.0
+    result_budget: int = 20_000
+    context_budget: int = 60_000
+    max_messages: int = 30
+    concurrency: int = 4
+    rate_limit: int = 20
+    rate_window: float = 600.0
+    fallback_period: float = 300.0
+
+    @classmethod
+    def from_env(cls, env=None) -> "Config | None":
+        """The configuration in ASSISTANT_* variables, or None when ASSISTANT_LLM_URL is unset."""
+        env = os.environ if env is None else env
+        url = env.get("ASSISTANT_LLM_URL", "").strip()
+        if not url:
+            return None
+
+        def number(name, default):
+            raw = env.get(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return type(default)(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be a number, not {raw!r}") from None
+
+        fallback = None
+        if fallback_url := env.get("ASSISTANT_FALLBACK_URL", "").strip():
+            fallback = Endpoint(
+                fallback_url, env.get("ASSISTANT_FALLBACK_MODEL", ""), env.get("ASSISTANT_FALLBACK_API_KEY", "")
+            )
+        return cls(
+            llm=Endpoint(url, env.get("ASSISTANT_LLM_MODEL", ""), env.get("ASSISTANT_LLM_API_KEY", "")),
+            fallback=fallback,
+            vision=env_flag(env.get("ASSISTANT_LLM_VISION")),
+            thinking=env_flag(env.get("ASSISTANT_THINKING")),
+            max_tool_calls=number("ASSISTANT_MAX_TOOL_CALLS", cls.max_tool_calls),
+            answer_timeout=number("ASSISTANT_ANSWER_TIMEOUT", cls.answer_timeout),
+            stall_timeout=number("ASSISTANT_STALL_TIMEOUT", cls.stall_timeout),
+            result_budget=number("ASSISTANT_RESULT_BUDGET", cls.result_budget),
+            context_budget=number("ASSISTANT_CONTEXT_BUDGET", cls.context_budget),
+            max_messages=number("ASSISTANT_MAX_MESSAGES", cls.max_messages),
+            concurrency=number("ASSISTANT_CONCURRENCY", cls.concurrency),
+            rate_limit=number("ASSISTANT_RATE_LIMIT", cls.rate_limit),
+            rate_window=number("ASSISTANT_RATE_WINDOW", cls.rate_window),
+        )
+
+
+# The prompt.
+
+SURVEYS = ("ZTF", "LSST")
+OBJECT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+PAGE_PATH = re.compile(r"/[A-Za-z0-9_./:%-]{0,200}")
+
+
+def now_line() -> str:
+    """The current time, in the two forms the tools take.
+
+    A model guessing the date from memory reaches for one in its training data,
+    and then searches a night with no alerts.
+    """
+    jd = s.now_jd()
+    return (
+        f"The time is {s.jd_to_iso(jd)[:16].replace('T', ' ')} UTC, which is JD {jd:.4f}. "
+        "Any window you pass to a tool should be near it."
+    )
+
+
+def describe_context(context: dict | None) -> str | None:
+    """What the person is looking at, from the page's own description of itself.
+
+    Only shapes an id or a path can have get through: this is text from the
+    browser going into the system prompt.
+    """
+    if not isinstance(context, dict):
+        return None
+    survey = context.get("survey")
+    survey = survey.upper() if isinstance(survey, str) and survey.upper() in SURVEYS else None
+    object_id = context.get("object_id")
+    if isinstance(object_id, str) and OBJECT_ID.fullmatch(object_id.strip()):
+        return f"the {survey} object {object_id.strip()}" if survey else f"the object {object_id.strip()}"
+    path = context.get("path")
+    if isinstance(path, str) and PAGE_PATH.fullmatch(path.strip()):
+        return f"the page {path.strip()} of the app"
+    return None
+
+
+def system_prompt(context: dict | None = None, vision: bool = False) -> str:
+    lines = [SYSTEM_PROMPT, VISION if vision else NO_VISION, INSTRUCTIONS, now_line()]
+    if where := describe_context(context):
+        lines.append(f"They are looking at {where}.")
+    return "\n\n".join(lines)
+
+
+# Ported from SkyPortal: fitting results into the context, and streamed replies.
+
+# Below this a per-item share carries nothing worth reading.
+MIN_ITEM_SHARE = 300
+
+
+def _reparsed(text):
+    """A condensed result as JSON where it still parses, else as its own text."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def condense(text: str, budget: int = 6000) -> str:
+    """Fit a tool result into a context budget without handing back broken JSON."""
+    if len(text) <= budget:
+        return text
+
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return text[:budget] + f"\n... truncated, {len(text)} characters in total"
+
+    if isinstance(payload, list):
+        kept = []
+        for item in payload:
+            kept.append(item)
+            if len(json.dumps(kept)) > budget:
+                kept.pop()
+                break
+        # Two items kept whole answer less than every item cut down, so take
+        # whichever form names more of them.
+        room = max(1, min(len(payload), budget // MIN_ITEM_SHARE))
+        if len(kept) >= room:
+            note = f"{len(payload) - len(kept)} more of {len(payload)} not shown"
+            return json.dumps({"items": kept, "note": note})
+        shown = payload[:room]
+        share = budget // len(shown)
+        items = [_reparsed(condense(json.dumps(item, default=str), share)) for item in shown]
+        left = len(payload) - len(shown)
+        note = "each item cut down to fit; asking for more per page will not add to it"
+        if left:
+            note = f"{len(shown)} of {len(payload)} shown, " + note
+        return json.dumps({"items": items, "note": note})
+
+    if not isinstance(payload, dict):
+        return text[:budget]
+
+    for key, value in payload.items():
+        if _numbers(value):
+            payload[key] = {"n": len(value), "min": min(value), "max": max(value)}
+    # Unlike SkyPortal's, small fields stay whole and the big ones share what is
+    # left. Cut to the whole budget each, one long list (the rows of a search)
+    # still overflows next to the counts, and is then dropped outright.
+    if (cap := _share(payload, budget)) is not None:
+        for key, value in payload.items():
+            if len(json.dumps(value, default=str)) > cap:
+                smaller = _shrunk(value, max(cap - NOTE_ROOM, MIN_ITEM_SHARE // 2))
+                if smaller is not None:
+                    payload[key] = smaller
+
+    dropped = []
+    by_size = sorted(payload, key=lambda k: -len(json.dumps(payload[k], default=str)))
+    for key in by_size:
+        current = json.dumps(payload, default=str)
+        if len(current) <= budget:
+            return current
+        payload.pop(key)
+        dropped.append(key)
+        payload["_dropped"] = f"fields too large to show: {', '.join(dropped)}"
+    return json.dumps(payload, default=str)
+
+
+# What condensing a list adds around the items it keeps: {"items": ..., "note": ...}.
+NOTE_ROOM = 120
+
+
+def _numbers(value) -> bool:
+    """A long list of plain numbers, which an answer can use the range of, never the values."""
+    return (
+        isinstance(value, list)
+        and len(value) >= 20
+        and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+    )
+
+
+def _share(payload: dict, budget: int) -> int | None:
+    """The most any one field may take so that all of them fit, or None if they already do."""
+    sizes = sorted(len(json.dumps(value, default=str)) for value in payload.values())
+    room = budget - sum(len(json.dumps(key)) + 2 for key in payload) - 2
+    for i, size in enumerate(sizes):
+        if size * (len(sizes) - i) > room:
+            return room // (len(sizes) - i)
+        room -= size
+    return None
+
+
+def _shrunk(value, budget):
+    """A smaller stand-in for an oversized value, or None if there isn't one.
+
+    A field is worth shrinking before it is worth dropping: a light curve cut to
+    its first rows still answers a question, and a deleted one answers nothing.
+    """
+    if _numbers(value):
+        return {"n": len(value), "min": min(value), "max": max(value)}
+    if not isinstance(value, (list, dict)) or not value:
+        return None
+    if len(json.dumps(value, default=str)) <= budget:
+        return None
+    return _reparsed(condense(json.dumps(value, default=str), budget))
+
+
+def chat_payload(model, messages, tools, thinking=False) -> dict:
+    """The body of a chat-completions request.
+
+    `tools` is omitted when empty rather than sent as []: the last round asks
+    for an answer with no tools left to call, and a server that rejects an
+    empty array turns that into a 400.
+    """
+    payload = {"model": model, "messages": messages, "temperature": 0}
+    if tools:
+        payload["tools"] = tools
+    if not thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return payload
+
+
+def merge_deltas(deltas) -> dict:
+    """The message the deltas of a streamed chat completion add up to."""
+    content, calls = [], {}
+    for delta in deltas:
+        content.append(delta.get("content") or "")
+        for part in delta.get("tool_calls") or []:
+            call = calls.setdefault(
+                part.get("index", 0),
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            function = part.get("function") or {}
+            call["id"] = part.get("id") or call["id"]
+            call["function"]["name"] = function.get("name") or call["function"]["name"]
+            call["function"]["arguments"] += function.get("arguments") or ""
+    message = {"role": "assistant", "content": "".join(content) or None}
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    return message
+
+
+def fit(messages: list[dict], budget: int) -> list[dict]:
+    """Shrink the oldest tool results until the conversation fits in budget characters.
+
+    Ten results of 20,000 characters are more than a 32k-token model holds, and
+    the server then refuses the whole request. The newest results matter most.
+    """
+
+    def size(message):
+        content = message.get("content")
+        return len(content) if isinstance(content, str) else 0
+
+    total = sum(size(m) for m in messages)
+    for message in messages:
+        if total <= budget:
+            break
+        if message.get("role") == "tool" and size(message) > SHRUNK_RESULT:
+            shorter = condense(message["content"], SHRUNK_RESULT)
+            total -= size(message) - len(shorter)
+            message["content"] = shorter
+    return messages
+
+
+def openai_tool(tool) -> dict:
+    return {
+        "type": "function",
+        "function": {"name": tool.name, "description": tool.description or "", "parameters": tool.input_schema},
+    }
+
+
+def split_content(result) -> tuple[str, list[dict]]:
+    """A tool result as the text the model reads and the images the person sees."""
+    texts, images = [], []
+    for block in result.content:
+        if block.type == "text":
+            texts.append(block.text)
+        elif block.type == "image":
+            images.append({"mime_type": block.mime_type, "data": block.data})
+    return "\n".join(texts), images
+
+
+def image_message(images: list[dict]) -> dict:
+    """The images of one round, for a model that can see."""
+    parts = [{"type": "text", "text": "The images the tools above returned, which the person also sees."}]
+    parts += [{"type": "image_url", "image_url": {"url": f"data:{i['mime_type']};base64,{i['data']}"}} for i in images]
+    return {"role": "user", "content": parts}
+
+
+def sse(event: dict) -> bytes:
+    return f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+
+
+# Errors.
+
+
+class ModelError(Exception):
+    """The model failed. `message` is for the person; `switchable` means another
+    endpoint (or another try) might do better."""
+
+    def __init__(self, message: str, switchable: bool = False, detail: str = ""):
+        super().__init__(detail or message)
+        self.message = message
+        self.switchable = switchable
+
+
+class OutOfTime(Exception):
+    """The answer's time ran out partway through a round; `said` is what it got out."""
+
+    def __init__(self, said: str = ""):
+        super().__init__("out of time")
+        self.said = said
+
+
+class BabamulDown(Exception):
+    pass
+
+
+class BadRequest(Exception):
+    pass
+
+
+@dataclass
+class Failure:
+    """The end of a question that failed. Before the stream starts it becomes a
+    plain JSON error with this status; after, an error event."""
+
+    status: int
+    message: str
+
+
+def refused(status: int, detail: str) -> ModelError:
+    if status == 429 or status >= 500:
+        return ModelError(UNREACHABLE, switchable=True, detail=detail)
+    if status in (401, 403, 404):
+        return ModelError(MISCONFIGURED, detail=detail)
+    return ModelError(REFUSED, detail=detail)
+
+
+# Limits.
+
+
+class RateLimiter:
+    """At most `limit` questions per `window` seconds for each person."""
+
+    def __init__(self, limit: int, window: float):
+        self.limit, self.window = limit, window
+        self.hits: dict[str, deque] = {}
+
+    def retry_after(self, key: str, now: float | None = None) -> float:
+        """Seconds until key may ask again, or 0 when it may ask now (which counts)."""
+        now = time.monotonic() if now is None else now
+        hits = self.hits.setdefault(key, deque())
+        while hits and hits[0] <= now - self.window:
+            hits.popleft()
+        if len(hits) >= self.limit:
+            return hits[0] + self.window - now
+        hits.append(now)
+        return 0.0
+
+    def refund(self, key: str):
+        if hits := self.hits.get(key):
+            hits.pop()
+
+
+class EventStream(StreamingResponse):
+    """A stream of events that stops the question as soon as the client leaves.
+
+    Starlette only watches for a disconnect on ASGI before 2.4, and otherwise
+    notices at the next write. Someone who presses Stop and asks again at once
+    would then be told a question is still running, so this always watches.
+    """
+
+    def __init__(self, content, on_close):
+        super().__init__(
+            content,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        self.on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            async with anyio.create_task_group() as tg:
+
+                async def stream():
+                    try:
+                        await self.stream_response(send)
+                    except OSError:
+                        pass  # the client left mid-write
+                    tg.cancel_scope.cancel()
+
+                tg.start_soon(stream)
+                await self.listen_for_disconnect(receive)
+                tg.cancel_scope.cancel()
+        finally:
+            self.on_close()
+
+
+class Assistant:
+    # How long a new question waits for one just stopped to wind down.
+    stop_grace = 3.0
+
+    def __init__(self, config: Config, *, http: httpx.AsyncClient | None = None, babamul_url: str | None = None):
+        self.config = config
+        self.http = http
+        self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
+        self.sem = asyncio.Semaphore(max(1, config.concurrency))
+        self.limiter = RateLimiter(config.rate_limit, config.rate_window)
+        # Person -> (ticket, start) of their running question.
+        self.active: dict[str, tuple[object, float]] = {}
+        # sha256 of a token -> (expiry, person or None when Babamul refused it).
+        self.tokens: dict[str, tuple[float, str | None]] = {}
+        self._main_skipped_until = 0.0
+        self._tools: list[dict] | None = None
+
+    @asynccontextmanager
+    async def running(self):
+        """Holds the HTTP client for the model and Babamul while the app runs."""
+        if self.http is not None:
+            yield
+            return
+        async with settings["http_client"]() as http:
+            self.http = http
+            try:
+                yield
+            finally:
+                self.http = None
+
+    # Routes.
+
+    async def health(self, request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "model": self.config.llm.model, "vision": self.config.vision})
+
+    async def chat(self, request: Request):
+        try:
+            messages, context = parse_body(await request.body())
+        except BadRequest as exc:
+            return error(400, str(exc))
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token:
+            return error(401, "Log in to Babamul to use the assistant.")
+        try:
+            person = await self.person(token)
+        except BabamulDown:
+            return error(503, "Could not reach Babamul to check your login. Try again in a minute.")
+        if person is None:
+            return error(401, "Babamul did not accept your login. Log in again.")
+
+        if not await self.idle(person):
+            return error(429, "You already have a question running. Wait for it to finish, or stop it.")
+        if (wait := self.limiter.retry_after(person)) > 0:
+            minutes = math.ceil(wait / 60)
+            return error(
+                429,
+                f"That is a lot of questions in a short time. Try again in {minutes} minute{'s' * (minutes > 1)}.",
+                headers={"Retry-After": str(math.ceil(wait))},
+            )
+
+        ticket = object()
+        self.active[person] = (ticket, time.monotonic())
+        queue: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait))
+
+        def close():
+            task.cancel()
+            if self.active.get(person, (None,))[0] is ticket:
+                del self.active[person]
+
+        try:
+            first = await self.first_event(request, queue)
+        except BaseException:
+            close()
+            raise
+        if first is None:
+            close()
+            return error(499, "The client left before the answer started.")
+        if isinstance(first, Failure):
+            close()
+            self.limiter.refund(person)
+            return error(first.status, first.message)
+        return EventStream(self.frames(first, queue), close)
+
+    async def first_event(self, request: Request, queue: asyncio.Queue):
+        """The question's first event, waited for so that a model that is down
+        gets a 503 instead of a stream with only an error in it.
+
+        None if the client leaves first: nothing else would notice before the
+        stream starts, and the question would hold the person's slot. A model
+        slow to take it still starts the stream after HEARTBEAT seconds.
+        """
+        getter = asyncio.ensure_future(queue.get())
+        give_up = time.monotonic() + HEARTBEAT
+        try:
+            while True:
+                done, _ = await asyncio.wait({getter}, timeout=0.5)
+                if done:
+                    return getter.result()
+                if await request.is_disconnected():
+                    return None
+                if time.monotonic() >= give_up:
+                    return {"type": "status", "message": "Waiting for the model"}
+        finally:
+            getter.cancel()
+
+    async def frames(self, first, queue: asyncio.Queue):
+        item = first
+        while item is not None:
+            if isinstance(item, Failure):
+                yield sse({"type": "error", "message": item.message})
+                return
+            if not item["type"].startswith("_"):
+                yield sse(item)
+            try:
+                async with asyncio.timeout(HEARTBEAT):
+                    item = await queue.get()
+            except TimeoutError:
+                item = {"type": "status", "message": "Still working"}
+
+    # Who is asking.
+
+    async def person(self, token: str) -> str | None:
+        """The Babamul user id the token belongs to, or None when Babamul refuses it.
+
+        GET /profile is the cheapest call Babamul authenticates, and the id lets
+        one person's login and API tokens share their limits.
+        """
+        key = hashlib.sha256(token.encode()).hexdigest()
+        now = time.monotonic()
+        if (hit := self.tokens.get(key)) and hit[0] > now:
+            return hit[1]
+        try:
+            response = await self.http.get(
+                f"{self.babamul_url}/profile",
+                headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
+                timeout=15,
+            )
+        except httpx.HTTPError as exc:
+            raise BabamulDown(str(exc)) from exc
+        if response.status_code in (401, 403):
+            person, ttl = None, BAD_TOKEN_TTL
+        elif response.status_code >= 400:
+            raise BabamulDown(f"profile returned {response.status_code}")
+        else:
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise BabamulDown("profile is not JSON") from exc
+            data = body.get("data", body) if isinstance(body, dict) else {}
+            person, ttl = str((data or {}).get("id") or key), TOKEN_TTL
+        if len(self.tokens) > 4096:
+            self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
+        self.tokens[key] = (now + ttl, person)
+        return person
+
+    def busy(self, person: str) -> bool:
+        entry = self.active.get(person)
+        # A question past its own timeout is gone, whatever its bookkeeping says.
+        return entry is not None and time.monotonic() - entry[1] < self.config.answer_timeout + 30
+
+    async def idle(self, person: str) -> bool:
+        """Whether person has no question running, after a moment for one just stopped."""
+        end = time.monotonic() + self.stop_grace
+        while self.busy(person):
+            if time.monotonic() >= end:
+                return False
+            await asyncio.sleep(0.1)
+        return True
+
+    # Answering.
+
+    async def run(self, messages, context, token, person, emit):
+        """Answer one question, every event and then None into emit."""
+        started = time.monotonic()
+        try:
+            calls = await self.answer(messages, context, token, emit)
+            log.info("answered user %s in %.1f s with %d tool calls", person, time.monotonic() - started, calls)
+        except ModelError as exc:
+            log.warning("model failed for user %s: %s", person, exc)
+            emit(Failure(503, exc.message))
+        except Exception:
+            log.exception("the assistant failed for user %s", person)
+            emit(Failure(500, BROKEN))
+        finally:
+            emit(None)
+
+    async def tools(self) -> list[dict]:
+        """The read-only tools, as the chat API wants them."""
+        if self._tools is None:
+            listed = await mcp.list_tools()
+            self._tools = [openai_tool(t) for t in listed if t.annotations and t.annotations.read_only_hint]
+        return self._tools
+
+    async def answer(self, messages, context, token, emit) -> int:
+        """Run the tool loop for the last question in messages, emitting events.
+
+        Returns the number of tool calls it made.
+        """
+        tools = await self.tools()
+        offered = {t["function"]["name"] for t in tools}
+        cfg = self.config
+        convo = [{"role": "system", "content": system_prompt(context, cfg.vision)}, *messages[-cfg.max_messages :]]
+        start = time.monotonic()
+        deadline = start + cfg.answer_timeout
+        tools_until = start + cfg.answer_timeout * TOOL_SHARE
+
+        reset = caller.set(Babamul(self.http, token, self.babamul_url))
+        try:
+            # One round can ask for several tools at once, so count the calls
+            # themselves. Counting rounds lets a paging model run on and on.
+            calls_made = 0
+            while calls_made < cfg.max_tool_calls:
+                if (left := tools_until - time.monotonic()) <= 0:
+                    break
+                try:
+                    message = await self.round(convo, tools, left, emit)
+                except OutOfTime:
+                    break
+                calls = message.get("tool_calls") or []
+                if not calls:
+                    emit({"type": "done", "content": (message.get("content") or "").strip() or NO_ANSWER})
+                    return calls_made
+                for call in calls:
+                    call["id"] = call["id"] or f"call_{uuid.uuid4().hex[:12]}"
+                convo.append(message)
+                seen = []
+                for call in calls:
+                    if calls_made >= cfg.max_tool_calls:
+                        # Every call needs an answer, or the server refuses the next round.
+                        content = "Not run: this question reached its limit of tool calls."
+                    else:
+                        calls_made += 1
+                        content, images = await self.call(call, offered, tools_until, emit)
+                        seen += images
+                    convo.append({"role": "tool", "tool_call_id": call["id"], "content": content})
+                if seen and cfg.vision:
+                    convo.append(image_message(seen))
+
+            # The cap or the clock stopped the tools: ask once more without them,
+            # or the model asks for another instead of answering.
+            convo.append({"role": "user", "content": ANSWER_NOW})
+            try:
+                message = await self.round(convo, [], deadline - time.monotonic(), emit)
+                text = (message.get("content") or "").strip() or NO_ANSWER
+            except OutOfTime as exc:
+                text = OUT_OF_TIME
+                if exc.said.strip():
+                    # Say so, or a sentence cut off mid-word reads like the whole answer.
+                    emit({"type": "text", "delta": CUT_SHORT})
+                    text = exc.said.strip() + CUT_SHORT
+            emit({"type": "done", "content": text})
+            return calls_made
+        finally:
+            caller.reset(reset)
+
+    async def call(self, call, offered, until, emit) -> tuple[str, list[dict]]:
+        """Run one tool call; the text for the model and the images it returned."""
+        name, call_id = call["function"]["name"], call["id"]
+        try:
+            arguments = json.loads(call["function"]["arguments"] or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError
+        except ValueError:
+            arguments = None
+        emit({"type": "tool_call", "id": call_id, "name": name, "arguments": arguments or {}})
+
+        text, images, ok = "", [], False
+        try:
+            if arguments is None:
+                raise ToolError("its arguments were not a JSON object")
+            if name not in offered:
+                raise ToolError(f"there is no tool called {name}")
+            async with asyncio.timeout(until - time.monotonic()):
+                result = await mcp.call_tool(name, arguments)
+            text, images = split_content(result)
+            ok = not result.is_error
+        except TimeoutError:
+            text = f"tool {name} ran out of time and was stopped"
+        except Exception as exc:
+            text = f"tool {name} failed: {exc}"
+        emit(
+            {
+                "type": "tool_result",
+                "id": call_id,
+                "name": name,
+                "ok": ok,
+                "summary": condense(text, SUMMARY_BUDGET),
+                "images": images,
+            }
+        )
+        content = condense(text, self.config.result_budget)
+        if images:
+            n = f"{len(images)} image{'s' * (len(images) > 1)}"
+            content += (
+                f"\n[{n} shown to the person in the chat, and attached below for you.]"
+                if self.config.vision
+                else f"\n[{n} shown to the person in the chat. You cannot see {'them' if len(images) > 1 else 'it'}.]"
+            )
+        return content, images
+
+    def endpoints(self) -> list[Endpoint]:
+        """Where to send one round, in the order to try them."""
+        main, fallback = self.config.llm, self.config.fallback
+        if fallback is None:
+            return [main, main]
+        if time.monotonic() < self._main_skipped_until:
+            return [fallback, main]
+        return [main, fallback]
+
+    async def round(self, messages, tools, budget, emit) -> dict:
+        """One model round, moved to the other endpoint if the first fails before saying anything.
+
+        Raises OutOfTime when budget runs out, and ModelError when no endpoint answers.
+        """
+        fit(messages, self.config.context_budget)
+        deadline = time.monotonic() + budget
+        failure: ModelError | None = None
+        for endpoint in self.endpoints():
+            if (left := deadline - time.monotonic()) <= 0:
+                break
+            said: list[str] = []
+            try:
+                async with asyncio.timeout(left):
+                    async with self.slot(emit):
+                        return await self.stream(endpoint, messages, tools, emit, said)
+            except TimeoutError:
+                raise OutOfTime("".join(said)) from None
+            except ModelError as exc:
+                if not exc.switchable or said:
+                    raise
+                failure = exc
+            except httpx.TransportError as exc:
+                # Unreachable, or silent for longer than the stall timeout.
+                if said:
+                    raise ModelError(STALLED, detail=repr(exc)) from exc
+                failure = ModelError(UNREACHABLE, switchable=True, detail=repr(exc))
+            log.warning("model at %s failed: %s", endpoint.base_url, failure)
+            if endpoint is self.config.llm and self.config.fallback is not None:
+                self._main_skipped_until = time.monotonic() + self.config.fallback_period
+        if failure is not None:
+            raise failure
+        raise OutOfTime()
+
+    @asynccontextmanager
+    async def slot(self, emit):
+        """One of the model calls allowed at once."""
+        if self.sem.locked():
+            emit({"type": "status", "message": "Waiting for the model"})
+        async with self.sem:
+            yield
+
+    async def stream(self, endpoint: Endpoint, messages, tools, emit, said: list[str]) -> dict:
+        """One streamed chat completion, its text emitted as it arrives."""
+        payload = {**chat_payload(endpoint.model, messages, tools, self.config.thinking), "stream": True}
+        headers = {"Accept": "text/event-stream"}
+        if endpoint.api_key:
+            headers["Authorization"] = f"Bearer {endpoint.api_key}"
+        stall = self.config.stall_timeout
+        async with self.http.stream(
+            "POST",
+            f"{endpoint.base_url.rstrip('/')}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=httpx.Timeout(stall, connect=min(10.0, stall)),
+        ) as response:
+            if response.status_code >= 400:
+                # The status alone says nothing: a refused request looks the same
+                # whether the context was too long or a tool schema was rejected.
+                detail = (await response.aread())[:600].decode(errors="replace")
+                log.warning(
+                    "model at %s refused the request: %s %s (messages=%d, tools=%d, %d chars)",
+                    endpoint.base_url,
+                    response.status_code,
+                    detail,
+                    len(messages),
+                    len(tools),
+                    len(json.dumps(messages)) + len(json.dumps(tools)),
+                )
+                raise refused(response.status_code, f"{response.status_code} {detail}")
+            emit({"type": "_started"})
+            deltas = []
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise ModelError(STALLED, switchable=not said, detail=str(chunk["error"])[:300])
+                for choice in (chunk.get("choices") or [])[:1]:
+                    delta = choice.get("delta") or {}
+                    deltas.append(delta)
+                    if text := delta.get("content"):
+                        said.append(text)
+                        emit({"type": "text", "delta": text})
+        return merge_deltas(deltas)
+
+
+def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
+    if len(raw) > MAX_BODY:
+        raise BadRequest("The conversation is too long. Start a new chat.")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise BadRequest("The request body is not JSON.") from None
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise BadRequest("messages must be a list with at least one message.")
+    turns = []
+    for message in messages:
+        if (
+            not isinstance(message, dict)
+            or message.get("role") not in ("user", "assistant")
+            or not isinstance(message.get("content"), str)
+        ):
+            raise BadRequest('Each message needs a role, "user" or "assistant", and its text as content.')
+        turns.append({"role": message["role"], "content": message["content"][:MAX_MESSAGE_CHARS]})
+    if turns[-1]["role"] != "user" or not turns[-1]["content"].strip():
+        raise BadRequest("The last message must be the user's question.")
+    context = body.get("context")
+    if context is not None and not isinstance(context, dict):
+        raise BadRequest("context must be an object.")
+    return turns, context
+
+
+def error(status: int, message: str, headers: dict | None = None) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status, headers=headers)
+
+
+def mount(app, assistant: Assistant, prefix: str = "/assistant"):
+    """Add the assistant's routes under prefix to a Starlette app, and run it with the app."""
+    prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    app.router.routes[0:0] = [
+        Route(f"{prefix}/health", assistant.health, methods=["GET"]),
+        Route(f"{prefix}/chat", assistant.chat, methods=["POST"]),
+    ]
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with inner(app) as state, assistant.running():
+            yield state
+
+    app.router.lifespan_context = lifespan
+    return app

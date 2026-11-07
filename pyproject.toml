@@ -10,6 +10,8 @@ dependencies = [
     "astropy",
     "matplotlib",
     "python-dotenv",
+    "starlette",
+    "uvicorn",
 ]
 
 [project.urls]

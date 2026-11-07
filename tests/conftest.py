@@ -115,12 +115,17 @@ def fits_gz(seed, background=100.0, source=300.0):
 class FakeBabamul:
     def __init__(self):
         self.requests = []
+        # Accepted tokens, and the user each belongs to.
+        self.tokens = {"bbml_test": "user-1"}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if request.headers.get("authorization") != "Bearer bbml_test":
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if token not in self.tokens:
             return httpx.Response(401, json={"message": "Unauthorized"})
         path, q = request.url.path.removeprefix("/api/babamul"), request.url.params
+        if path == "/profile":
+            return ok({"id": self.tokens[token], "username": "tester", "email": "tester@example.org"})
         if path == "/surveys/ZTF/alerts":
             lo, hi = float(q.get("start_jd", 0)), float(q.get("end_jd", 1e9))
             rows = [a for a in ALERTS if lo <= a["candidate"]["jd"] <= hi]

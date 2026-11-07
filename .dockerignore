@@ -1,0 +1,14 @@
+.git
+.venv
+.pytest_cache
+**/__pycache__
+.env
+*.env
+.mcp.json
+# The school hunt holds the answer key.
+hunt
+scripts
+tests
+flake.nix
+flake.lock
+*.sif

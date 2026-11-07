@@ -3,6 +3,7 @@
 import inspect
 import os
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 import httpx
 from mcp.server.mcpserver import Context, MCPServer
@@ -42,7 +43,9 @@ probability that a bright (<18.5 mag) transient is a supernova worth Bright \
 Transient Survey follow-up. AppleCiDEr is hierarchical (domain, family, class) \
 and abstains when unsure: an abstention or a family-level decision is \
 information, not a missing value. Its out_of_distribution flag marks alerts \
-unlike its training set, which is how BOOM flags anomalies.
+unlike its training set, which is how BOOM flags anomalies. Many flagged \
+alerts are known asteroids (flags.rock), so pass exclude_solar_system=true \
+when looking for anomalous transients.
 - Candidate ids (candid) are 19-digit integers. Pass and quote them as \
 strings: as JSON numbers they lose their last digits.
 - An empty result is more often a too-tight cut or the wrong survey than an \
@@ -81,9 +84,18 @@ def tool(**kwargs):
     return register
 
 
+# The Babamul client of the person the assistant is answering. The assistant
+# calls tools in this process, with no HTTP request behind them, so this is how a
+# tool learns whose token to use. It is set inside the task answering one
+# question, so it never leaks to other callers.
+caller: ContextVar[Babamul | None] = ContextVar("caller", default=None)
+
+
 def babamul(ctx: Context) -> Babamul:
-    """A Babamul client acting as the caller: their Bearer token over HTTP,
-    BABAMUL_API_TOKEN over stdio."""
+    """A Babamul client acting as the caller: the assistant's user, else their
+    Bearer token over HTTP, else BABAMUL_API_TOKEN over stdio."""
+    if (client := caller.get()) is not None:
+        return client
     state = ctx.request_context.lifespan_context
     token = None
     auth = (ctx.headers or {}).get("authorization", "")
