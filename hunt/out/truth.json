@@ -1,0 +1,43 @@
+{
+ "start_card": "At MJD 61353.30, something brighter than 14th magnitude appeared that no survey should have seen.",
+ "signpost": {
+  "object_id": "ZTF26openeye",
+  "ra": 24.162,
+  "dec": 15.796000000000001,
+  "candid": "9000000000057010039",
+  "utc": "2026-11-09T07:11:59.999984+00:00",
+  "mag_r": 13.62,
+  "cutout_text": "GO N 45\""
+ },
+ "treasure": {
+  "object_id": "ZTF26rubinml",
+  "ra": 24.162,
+  "dec": 15.8085,
+  "candids": [
+   "9000000000019010039",
+   "9000000000031010039",
+   "9000000000043010039",
+   "9000000000053010039"
+  ],
+  "separation_from_signpost_arcsec": 45.0,
+  "host": "M74 (NGC 628), the Phantom Galaxy",
+  "cutout_text": "HONEYCRISP",
+  "light_curve": "an apple: red (r) outline, orange (i) stem, green (g) leaf",
+  "first_detection_utc": "2026-10-31T14:09:42.943623+00:00",
+  "last_nondetection_utc": "2026-10-27T18:00:00+00:00",
+  "n_detections": 49
+ },
+ "read_after_ingestion": [
+  "applecider decision and out_of_distribution flag",
+  "find_similar_objects neighbors",
+  "Villar fit verdict"
+ ],
+ "cleanup": "delete objectId ZTF26openeye and ZTF26rubinml (alerts, aux, cutouts, embeddings); every candid is >= 9e18",
+ "files": [
+  "public/20261104/9000000000019010039.avro",
+  "public/20261105/9000000000031010039.avro",
+  "public/20261107/9000000000043010039.avro",
+  "public/20261110/9000000000053010039.avro",
+  "public/20261109/9000000000057010039.avro"
+ ]
+}
