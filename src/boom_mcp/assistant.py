@@ -22,6 +22,7 @@ import re
 import time
 import uuid
 from collections import deque
+from collections.abc import Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -79,6 +80,7 @@ CUT_SHORT = "\n\n(I ran out of time here, so this answer is cut short.)"
 TOO_LONG = "\n\n(This answer reached its length limit, so it is cut short.)"
 LINE_FULL = "The assistant is busy with other people's questions. Try again in a few minutes."
 WAITED_TOO_LONG = "The assistant is still busy with other people's questions. Try again in a few minutes."
+REPLACED = "Stopped because you asked a new question, here or in another tab."
 
 # The part of the answer timeout the tool loop may use. The rest is kept for the
 # final answer, so running out of time still ends in an answer.
@@ -668,8 +670,8 @@ class EventStream(StreamingResponse):
     """A stream of events that stops the question as soon as the client leaves.
 
     Starlette only watches for a disconnect on ASGI before 2.4, and otherwise
-    notices at the next write. Someone who presses Stop and asks again at once
-    would then be told a question is still running, so this always watches.
+    notices at the next write. A stopped question would then keep its model slot
+    and its place in line until it next said something, so this always watches.
     """
 
     def __init__(self, content, on_close):
@@ -699,7 +701,7 @@ class EventStream(StreamingResponse):
 
 
 class Assistant:
-    # How long a new question waits for one just stopped to wind down.
+    # How long a new question waits for the one it replaces to wind down.
     stop_grace = 3.0
 
     def __init__(self, config: Config, *, http: httpx.AsyncClient | None = None, babamul_url: str | None = None):
@@ -708,8 +710,10 @@ class Assistant:
         self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
         self.line = Line(config.concurrency, config.max_queue)
         self.limiter = RateLimiter(config.rate_limit, config.rate_window)
-        # Person -> (ticket, start) of their running question.
-        self.active: dict[str, tuple[object, float]] = {}
+        # Person -> (ticket, stop) of their running question; stop ends it.
+        self.active: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
+        # Person -> the newest of their questions still taking over from the last.
+        self.claims: dict[str, object] = {}
         # sha256 of a token -> (expiry, person or None when Babamul refused it).
         self.tokens: dict[str, tuple[float, str | None]] = {}
         self._main_skipped_until = 0.0
@@ -752,8 +756,6 @@ class Assistant:
         if person is None:
             return error(401, "Babamul did not accept your login. Log in again.")
 
-        if not await self.idle(person):
-            return error(429, "You already have a question running. Wait for it to finish, or stop it.")
         if (wait := self.limiter.retry_after(person)) > 0:
             minutes = math.ceil(wait / 60)
             return error(
@@ -761,16 +763,41 @@ class Assistant:
                 f"That is a lot of questions in a short time. Try again in {minutes} minute{'s' * (minutes > 1)}.",
                 headers={"Retry-After": str(math.ceil(wait))},
             )
-        # Taken here, before anything awaits, so a burst cannot overfill the line.
-        if (place := self.line.join()) is None:
-            self.limiter.refund(person)
-            log.warning("turned user %s away: %d questions already waiting", person, len(self.line.waiting))
-            return error(429, LINE_FULL, headers={"Retry-After": "60"})
+        # One question per person: a new one replaces the one running. The panel
+        # shows one answer at a time, and the old one may have no reader left (a
+        # tunnel can drop the browser's stream without closing ours), so turning
+        # the new one away would lock the person out until the old one ends.
+        claim = object()
+        self.claims[person] = claim
+        try:
+            await self.replace(person, claim)
+            if self.claims.get(person) is not claim:
+                # A newer question of theirs came in meanwhile, and it wins. This
+                # one was asked all the same, so it still counts toward the limit.
+                return error(409, REPLACED)
+            # Taken here, after the last await, so a burst cannot overfill the line.
+            if (place := self.line.join()) is None:
+                self.limiter.refund(person)
+                log.warning("turned user %s away: %d questions already waiting", person, len(self.line.waiting))
+                return error(429, LINE_FULL, headers={"Retry-After": "60"})
 
-        ticket = object()
-        self.active[person] = (ticket, time.monotonic())
-        queue: asyncio.Queue = asyncio.Queue()
-        task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place))
+            ticket = object()
+            queue: asyncio.Queue = asyncio.Queue()
+            task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place))
+
+            async def stop():
+                # The Failure ends the old stream even if its task never started.
+                queue.put_nowait(Failure(409, REPLACED))
+                task.cancel()
+                await asyncio.wait({task}, timeout=self.stop_grace)
+                if task.done():
+                    # A task cancelled before it started never left the line itself.
+                    self.line.leave(place)
+
+            self.active[person] = (ticket, stop)
+        finally:
+            if self.claims.get(person) is claim:
+                del self.claims[person]
 
         def close():
             task.cancel()
@@ -789,7 +816,10 @@ class Assistant:
             return error(499, "The client left before the answer started.")
         if isinstance(first, Failure):
             close()
-            self.limiter.refund(person)
+            if first.message != REPLACED:
+                # Our failure, not their choice: it does not count. A replaced one does,
+                # or asking again before each answer starts would never reach the limit.
+                self.limiter.refund(person)
             return error(first.status, first.message)
         return EventStream(self.frames(first, queue), close)
 
@@ -798,7 +828,7 @@ class Assistant:
         gets a 503 instead of a stream with only an error in it.
 
         None if the client leaves first: nothing else would notice before the
-        stream starts, and the question would hold the person's slot. A model
+        stream starts, and the question would keep its place in line. A model
         slow to take it still starts the stream after HEARTBEAT seconds.
         """
         getter = asyncio.ensure_future(queue.get())
@@ -867,20 +897,15 @@ class Assistant:
         self.tokens[key] = (now + ttl, person)
         return person
 
-    def busy(self, person: str) -> bool:
-        entry = self.active.get(person)
-        # A question past its own timeouts is gone, whatever its bookkeeping says.
-        limit = self.config.queue_timeout + self.config.answer_timeout + 30
-        return entry is not None and time.monotonic() - entry[1] < limit
+    async def replace(self, person: str, claim: object) -> None:
+        """Stop person's running question, if any, and give it a moment to wind down.
 
-    async def idle(self, person: str) -> bool:
-        """Whether person has no question running, after a moment for one just stopped."""
-        end = time.monotonic() + self.stop_grace
-        while self.busy(person):
-            if time.monotonic() >= end:
-                return False
-            await asyncio.sleep(0.1)
-        return True
+        A loop, since another of their questions may start while this one waits;
+        it ends once a newer question has claimed the person, which then wins.
+        """
+        while self.claims.get(person) is claim and (entry := self.active.pop(person, None)) is not None:
+            log.info("user %s asked again, so their running question stops", person)
+            await entry[1]()
 
     # Answering.
 

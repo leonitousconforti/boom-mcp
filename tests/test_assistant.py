@@ -119,7 +119,6 @@ def make(fake):
             **config,
         )
         bot = a.Assistant(cfg, http=httpx.AsyncClient(transport=httpx.MockTransport(route)))
-        bot.stop_grace = 0
         return SimpleNamespace(bot=bot, model=model, backup=backup, babamul=fake)
 
     return make
@@ -314,22 +313,119 @@ async def test_401_before_the_model_is_asked(make):
     assert len([p for p in profiles if p.headers["authorization"] == "Bearer bbml_test"]) == 1  # cached
 
 
-async def test_one_question_at_a_time_per_person(make):
-    gate = asyncio.Event()
-    t = make(stream(say("Thinking "), gate, say("about it.")), say("Next answer."))
-    # A second token of the same person shares the limit.
+def last_event(response) -> dict:
+    """How a question ended: its last event, or the error it got before its stream started."""
+    if response.status_code == 409:
+        return {"type": "error", "message": response.json()["error"]}
+    return events(response)[-1]
+
+
+async def test_asking_again_replaces_the_running_question(make):
+    gate = asyncio.Event()  # never set: the first answer would never finish
+    cancelled = asyncio.Event()
+
+    async def endless():
+        try:
+            async for part in stream(say("Thinking "), gate, say("about it.")):
+                yield part
+        finally:
+            cancelled.set()
+
+    t = make(endless(), say("Next answer."))
+    # A second token of the same person counts as the same person.
     t.babamul.tokens["bbml_second"] = "user-1"
     app = app_of(t.bot)
     first = asyncio.create_task(ask(app))
-    while not t.model.requests:
-        await asyncio.sleep(0.01)
+    await until(lambda: t.model.requests)
 
-    busy = await ask(app, token="bbml_second")
-    assert busy.status_code == 429 and "already have a question running" in busy.json()["error"]
+    second = await asyncio.wait_for(ask(app, token="bbml_second"), 5)
+    assert events(second)[-1] == {"type": "done", "content": "Next answer."}
+    evs = events(await asyncio.wait_for(first, 2))
+    assert evs[0] == {"type": "text", "delta": "Thinking "}
+    assert evs[-1] == {"type": "error", "message": a.REPLACED}
+    await asyncio.wait_for(cancelled.wait(), 2)  # the model stopped working on it
+    assert t.bot.active == {} and t.bot.line.answering == set() and t.bot.line.waiting == []
 
+
+async def test_asking_again_while_in_line_gives_up_the_old_place(make):
+    gate = asyncio.Event()
+    t = make(stream(say("Busy "), gate, say("done.")), say("Second try."), concurrency=1)
+    t.babamul.tokens.update({"bbml_two": "user-2", "bbml_second": "user-1"})
+    app = app_of(t.bot)
+    other = asyncio.create_task(ask(app, token="bbml_two"))
+    await until(lambda: t.model.requests)
+    old = asyncio.create_task(ask(app, question="first try"))
+    await until(lambda: t.bot.line.waiting)
+
+    new = asyncio.create_task(ask(app, question="second try", token="bbml_second"))
+    assert events(await asyncio.wait_for(old, 3)) == [
+        {"type": "status", "message": "Waiting for the model, you are next"},
+        {"type": "error", "message": a.REPLACED},
+    ]
+    await until(lambda: len(t.bot.line.waiting) == 1)  # only the new question waits
     gate.set()
-    assert types(events(await first))[-1] == "done"
-    assert events(await ask(app, token="bbml_second"))[-1] == {"type": "done", "content": "Next answer."}
+    assert events(await other)[-1] == {"type": "done", "content": "Busy done."}
+    assert events(await new)[-1] == {"type": "done", "content": "Second try."}
+    asked = [r.body["messages"][1]["content"] for r in t.model.requests]
+    assert asked == ["What is new tonight?", "second try"]
+    assert t.bot.line.waiting == [] and t.bot.active == {}
+
+
+async def test_two_questions_asked_at_once_leave_the_newest_running(make):
+    gate, later = asyncio.Event(), asyncio.Event()
+    t = make(stream(say("Thinking "), gate, say("about it.")), lambda body: stream(say("Answer "), later, say("now.")))
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app))
+    await until(lambda: t.model.requests)
+
+    older = asyncio.create_task(ask(app, question="older"))
+    newer = asyncio.create_task(ask(app, question="newer"))
+    assert last_event(await asyncio.wait_for(older, 5)) == {"type": "error", "message": a.REPLACED}
+    assert events(await asyncio.wait_for(first, 2))[-1] == {"type": "error", "message": a.REPLACED}
+    assert len(t.bot.active) == 1 and len(t.bot.line.answering) == 1  # never two of theirs at once
+    later.set()
+    assert last_event(await asyncio.wait_for(newer, 5)) == {"type": "done", "content": "Answer now."}
+    assert "older" not in [r.body["messages"][1]["content"] for r in t.model.requests]
+    assert t.bot.active == {} and t.bot.claims == {} and t.bot.line.answering == set() and t.bot.line.waiting == []
+
+
+async def test_a_question_replaced_before_it_started_gives_back_its_place(make):
+    gate = asyncio.Event()
+    t = make(say("Warm."), stream(say("Busy "), gate, say("done.")), say("Second try."), concurrency=1, max_queue=1)
+    t.babamul.tokens["bbml_two"] = "user-2"
+    app = app_of(t.bot)
+    assert events(await ask(app))[-1]["type"] == "done"  # the token is known now, so nothing below waits on Babamul
+    other = asyncio.create_task(ask(app, token="bbml_two"))
+    await until(lambda: t.model.requests[1:])
+
+    # Asked in the same instant: the first one's task has not started when the second replaces it.
+    one, two = asyncio.create_task(ask(app, question="one")), asyncio.create_task(ask(app, question="two"))
+    assert last_event(await asyncio.wait_for(one, 3)) == {"type": "error", "message": a.REPLACED}
+    gate.set()
+    assert events(await other)[-1] == {"type": "done", "content": "Busy done."}
+    assert events(await asyncio.wait_for(two, 3))[-1] == {"type": "done", "content": "Second try."}
+    assert t.bot.line.waiting == [] and t.bot.line.answering == set() and t.bot.active == {}
+
+
+async def test_a_question_replaced_before_its_answer_starts_still_counts(make):
+    headers = asyncio.Event()
+
+    async def slow(body):
+        await headers.wait()  # the model takes its time to start answering
+        return stream(say("Answer."))
+
+    t = make(slow, rate_limit=2, rate_window=600)
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app, question="first"))
+    await until(lambda: t.model.requests)
+    second = asyncio.create_task(ask(app, question="second"))
+    replaced = await asyncio.wait_for(first, 3)
+    assert replaced.status_code == 409 and replaced.json() == {"error": a.REPLACED}
+    headers.set()
+    assert events(await asyncio.wait_for(second, 3))[-1] == {"type": "done", "content": "Answer."}
+    assert len(t.bot.limiter.hits["user-1"]) == 2
+    third = await ask(app)
+    assert third.status_code == 429 and "Try again in 10 minutes" in third.json()["error"]
 
 
 async def test_rate_limit(make):
