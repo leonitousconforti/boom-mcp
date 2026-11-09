@@ -21,6 +21,15 @@ ENV_FILES = [".env", "setup/.env", "../setup/.env", "../../setup/.env"]
 # Browser clients on this machine, such as a local llama.cpp web UI, on any port.
 LOCAL_ORIGINS = r"http://(localhost|127\.0\.0\.1|\[::1\]):\d+"
 
+# The binds for which the MCP SDK accepts only local Host headers on /mcp.
+LOCAL_BINDS = ("127.0.0.1", "localhost", "::1")
+
+# Seconds a restart waits for open answers before it cuts them off. Without a
+# limit uvicorn waits for every one, up to the whole answer timeout.
+SHUTDOWN_GRACE = 10
+
+log = logging.getLogger("boom_mcp.server")
+
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> JSONResponse:
@@ -40,6 +49,24 @@ def transport_security(hosts: list[str], cors_origins: list[str]) -> TransportSe
             origins.append(f"https://{host}")
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True, allowed_hosts=allowed, allowed_origins=origins
+    )
+
+
+def host_warning(args) -> str | None:
+    """What to say at startup when /mcp will refuse, or accept, more Host headers than
+    is likely meant. The Host check lives in the MCP transport, so only /mcp has it."""
+    if args.allowed_host:
+        return None
+    if args.host in LOCAL_BINDS or args.cors_origin:
+        return (
+            f"/mcp accepts only the Host headers localhost:{args.port} and 127.0.0.1:{args.port}. "
+            "Behind a proxy or tunnel that passes on a public name, such as babamul.umn.edu, "
+            "/mcp answers 421: start with --allowed-host NAME for each name it is reached by. "
+            "The assistant's routes do not check Host."
+        )
+    return (
+        f"--host {args.host} without --allowed-host: /mcp accepts any Host header. "
+        "Name the hosts it is reached by with --allowed-host."
     )
 
 
@@ -68,13 +95,18 @@ def http_app(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--http", action="store_true", help="Serve Streamable HTTP instead of stdio.")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="The address to listen on. The default, 127.0.0.1, is for a proxy or tunnel on this machine.",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--allowed-host",
         action="append",
         default=[],
-        help="A Host header to accept, e.g. boom-mcp.example.org or 10.0.0.5:*. Repeatable.",
+        help="A Host header /mcp accepts, e.g. boom-mcp.example.org or 10.0.0.5:*. Repeatable. "
+        "Needed for each public name a proxy passes on.",
     )
     parser.add_argument(
         "--cors-origin",
@@ -131,8 +163,16 @@ def main():
         assistant.log.propagate = False
 
     if args.http:
+        if warning := host_warning(args):
+            log.warning(warning)
         settings["require_client_token"] = not args.shared_token
-        uvicorn.run(http_app(args), host=args.host, port=args.port, log_level=mcp.settings.log_level.lower())
+        uvicorn.run(
+            http_app(args),
+            host=args.host,
+            port=args.port,
+            log_level=mcp.settings.log_level.lower(),
+            timeout_graceful_shutdown=SHUTDOWN_GRACE,
+        )
     else:
         mcp.run()
 

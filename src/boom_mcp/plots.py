@@ -1,18 +1,18 @@
-"""PNG renderings a vision model can read: cutout triplets and light curves."""
+"""PNG renderings a vision model can read: cutout triplets and light curves.
+
+Figures are built with matplotlib's Figure class, not pyplot, whose global
+figure list is not safe to use from a worker thread. The tools render in one.
+"""
 
 import gzip
 import io
 import warnings
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-from astropy.io import fits  # noqa: E402
-from astropy.io.fits.verify import VerifyWarning  # noqa: E402
-from astropy.visualization import AsymmetricPercentileInterval, ImageNormalize, LinearStretch  # noqa: E402
+import numpy as np
+from astropy.io import fits
+from astropy.io.fits.verify import VerifyWarning
+from astropy.visualization import AsymmetricPercentileInterval, ImageNormalize, LinearStretch
+from matplotlib.figure import Figure
 
 BAND_COLORS = {"g": "#2ca02c", "r": "#d62728", "i": "#ff7f0e", "z": "#8c564b", "y": "#7f7f7f", "u": "#1f77b4"}
 SURVEY_MARKERS = {"ztf": "o", "lsst": "s", "decam": "D"}
@@ -32,13 +32,13 @@ def _image(data: bytes) -> np.ndarray:
 def _png(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
     return buf.getvalue()
 
 
 def cutout_triplet(science: bytes, template: bytes, difference: bytes, title: str, flip: bool = False) -> bytes:
     """`flip` turns ZTF stamps north-up, as the Babamul client and website show them."""
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3.4))
+    fig = Figure(figsize=(9, 3.4))
+    axes = fig.subplots(1, 3)
     for ax, name, raw in zip(axes, ("science", "template", "difference"), (science, template, difference)):
         ax.set_xticks([])
         ax.set_yticks([])
@@ -66,7 +66,8 @@ def cutout_triplet(science: bytes, template: bytes, difference: bytes, title: st
 
 
 def light_curve(rows: list[dict], title: str) -> bytes:
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig = Figure(figsize=(8, 4.5))
+    ax = fig.subplots()
     t0 = min(r["jd"] for r in rows)
     for band in sorted({r["band"] for r in rows}):
         survey = next((s for s in SURVEY_MARKERS if band.startswith(s)), "ztf")

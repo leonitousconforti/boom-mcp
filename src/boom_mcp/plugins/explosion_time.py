@@ -10,21 +10,36 @@ last non-detection and first detection, which is what "is this young?" means
 when choosing what to follow up tonight.
 """
 
+from typing import Literal
+
 from mcp.server.mcpserver import Context
 
 from boom_mcp import summarize as s
 from boom_mcp.app import babamul, tool
+from boom_mcp.babamul import checked_object_id
+
+# Forced photometry measures hundreds of epochs whatever is there, so a 3-sigma
+# blip among them is expected by chance. Only a 5-sigma one counts as a
+# detection; magerr is 1.0857 / SNR.
+FORCED_MIN_SNR = 5
+
+
+def _detected(row: dict) -> bool:
+    if "mag" not in row or row.get("negative"):
+        return False
+    return row["source"] != "forced" or (row.get("magerr") or 99) <= 1.0857 / FORCED_MIN_SNR
 
 
 @tool()
-async def estimate_explosion_time(ctx: Context, object_id: str, survey: str = "ZTF") -> dict:
+async def estimate_explosion_time(ctx: Context, object_id: str, survey: Literal["ZTF", "LSST"] = "ZTF") -> dict:
     """Bound when a transient first appeared, from the deepest non-detection before its first
     detection (in any band). Returns the window, its midpoint, and how many days ago that was.
     A window under ~2 days with a first detection in the last few days marks a young transient.
     """
-    obj = await babamul(ctx).get(f"/surveys/{survey}/objects/{object_id}")
+    # Checked before it goes into the URL path, where "../" would reach another route.
+    obj = await babamul(ctx).get(f"/surveys/{survey}/objects/{checked_object_id(object_id)}")
     rows = s.light_curve_rows(obj, survey, forced=True, limits=True, other_survey=True)
-    detections = [r for r in rows if "mag" in r and not r.get("negative")]
+    detections = [r for r in rows if _detected(r)]
     if not detections:
         return {"object_id": object_id, "verdict": "no detections"}
     first = detections[0]

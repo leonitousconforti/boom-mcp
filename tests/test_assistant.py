@@ -5,6 +5,8 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
+import sys
 import time
 from types import SimpleNamespace
 
@@ -13,8 +15,9 @@ import pytest
 from starlette.applications import Starlette
 
 from boom_mcp import assistant as a
-from boom_mcp.app import caller
-from boom_mcp.server import http_app
+from boom_mcp import plugins, server
+from boom_mcp.app import caller, mcp, settings
+from boom_mcp.server import host_warning, http_app
 
 pytestmark = pytest.mark.anyio
 
@@ -61,6 +64,8 @@ class FakeModel:
             raise step
         if isinstance(step, int):
             return httpx.Response(step, json={"error": {"message": "refused"}})
+        if isinstance(step, httpx.Response):
+            return step
         if not hasattr(step, "__aiter__"):
             step = stream(step)
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=step)
@@ -78,6 +83,21 @@ async def stream(deltas, gate: asyncio.Event | None = None, after=()):
 
 def has_tools(body):
     return bool(body.get("tools"))
+
+
+async def slowly(*pieces, pause):
+    """A reply in text, pause seconds between its pieces."""
+    for i, piece in enumerate(pieces):
+        if i:
+            await asyncio.sleep(pause)
+        yield chunk({"content": piece})
+    yield b"data: [DONE]\n\n"
+
+
+async def until(condition, timeout=3.0):
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.01)
 
 
 @pytest.fixture
@@ -170,8 +190,10 @@ async def test_streams_text_tools_images_and_done(make, monkeypatch):
     tool_messages = [m for m in last.body["messages"] if m["role"] == "tool"]
     assert [m["tool_call_id"] for m in tool_messages] == ["call_get_object_0", "call_get_cutouts_0"]
     assert json.loads(tool_messages[0]["content"])["latest_alert"]["candid"] == "3123456789012345678"
-    assert "1 image shown to the person in the chat. You cannot see it." in tool_messages[1]["content"]
+    assert tool_messages[1]["content"].startswith("[1 image shown to the person in the chat. You cannot see it.]\n")
     assert "image_url" not in json.dumps(last.body)
+    assert all("finish_reason" not in m for m in last.body["messages"])
+    assert last.body["max_tokens"] == 1024
 
     assert t.babamul.requests and {r.headers["authorization"] for r in t.babamul.requests} == {"Bearer bbml_test"}
 
@@ -490,17 +512,23 @@ def test_config_from_env():
     cfg = a.Config.from_env(
         {
             "ASSISTANT_LLM_URL": "https://llm.example.org/v1",
-            "ASSISTANT_LLM_MODEL": "qwen",
-            "ASSISTANT_LLM_API_KEY": "sk-secret",
+            "ASSISTANT_LLM_MODEL": "qwen\n",
+            "ASSISTANT_LLM_API_KEY": " sk-secret\n",
             "ASSISTANT_LLM_VISION": "true",
             "ASSISTANT_MAX_TOOL_CALLS": "6",
             "ASSISTANT_ANSWER_TIMEOUT": "120",
+            "ASSISTANT_QUEUE_TIMEOUT": "90",
+            "ASSISTANT_MAX_QUEUE": "",
             "ASSISTANT_FALLBACK_URL": "https://backup.example.org/v1",
+            "ASSISTANT_FALLBACK_MODEL": " backup ",
+            "ASSISTANT_FALLBACK_API_KEY": "sk-backup\n",
         }
     )
-    assert cfg.llm.api_key == "sk-secret" and cfg.vision and not cfg.thinking
-    assert cfg.max_tool_calls == 6 and cfg.answer_timeout == 120.0 and cfg.concurrency == 4
-    assert cfg.fallback.base_url == "https://backup.example.org/v1"
+    # Strings from an env file lose the whitespace around them.
+    assert cfg.llm.model == "qwen" and cfg.llm.api_key == "sk-secret" and cfg.vision and not cfg.thinking
+    assert cfg.fallback == a.Endpoint("https://backup.example.org/v1", "backup", "sk-backup")
+    assert cfg.max_tool_calls == 6 and cfg.answer_timeout == 120.0
+    assert cfg.concurrency == 2 and cfg.queue_timeout == 90.0 and cfg.max_queue == 20 and cfg.max_tokens == 1024
     assert "sk-secret" not in repr(cfg)
     with pytest.raises(ValueError, match="ASSISTANT_CONCURRENCY"):
         a.Config.from_env({"ASSISTANT_LLM_URL": "x", "ASSISTANT_CONCURRENCY": "lots"})
@@ -569,3 +597,459 @@ def test_chat_payload_and_fit():
     messages = [{"role": "system", "content": "s"}, {"role": "tool", "content": result}, {"role": "tool", "content": result}]
     a.fit(messages, len(result) + 3000)
     assert len(messages[1]["content"]) <= a.SHRUNK_RESULT and messages[2]["content"] == result
+
+
+# The line for the model.
+
+
+def test_line():
+    line = a.Line(1, 2)
+    first, second, third = line.join(), line.join(), line.join()
+    assert first.admitted and not second.admitted and not third.admitted
+    assert line.join() is None  # full
+    assert line.ahead(second) == 0 and line.ahead(third) == 1
+    line.leave(second)  # gave up while waiting
+    assert line.ahead(third) == 0 and third.moved.is_set()
+    line.leave(first)
+    assert third.admitted and line.waiting == [] and line.answering == {third}
+    line.leave(first)  # leaving twice changes nothing
+    assert line.answering == {third}
+    assert a.waiting_message(0) == "Waiting for the model, you are next"
+    assert a.waiting_message(1) == "Waiting for the model, 1 question ahead of you"
+    assert a.waiting_message(3) == "Waiting for the model, 3 questions ahead of you"
+
+
+async def test_questions_wait_in_line_and_keep_their_place(make):
+    gates = {"first": asyncio.Event(), "second": asyncio.Event()}
+
+    def script(body):
+        question = body["messages"][1]["content"]
+        if body["messages"][-1]["role"] == "tool":
+            return say(f"Answer to {question}.")
+        return stream(use("convert_time"), gates[question]) if question in gates else use("convert_time")
+
+    t = make(script, concurrency=1)
+    t.babamul.tokens.update({"bbml_two": "user-2", "bbml_three": "user-3"})
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app, "first"))
+    await until(lambda: t.model.requests)
+    second = asyncio.create_task(ask(app, "second", token="bbml_two"))
+    await until(lambda: len(t.bot.line.waiting) == 1)
+    third = asyncio.create_task(ask(app, "third", token="bbml_three"))
+    await until(lambda: len(t.bot.line.waiting) == 2)
+    gates["first"].set()
+    await until(lambda: len(t.model.requests) == 3)  # the second question has the model
+    await asyncio.sleep(0.05)  # and the third has heard it moved up
+    gates["second"].set()
+    one, two, three = [events(await task) for task in (first, second, third)]
+
+    # Each question keeps the model through its tool call, rather than taking turns per round.
+    order = [r.body["messages"][1]["content"] for r in t.model.requests]
+    assert order == ["first", "first", "second", "second", "third", "third"]
+    assert two[0] == {"type": "status", "message": "Waiting for the model, you are next"}
+    assert three[0] == {"type": "status", "message": "Waiting for the model, 1 question ahead of you"}
+    assert three[1] == {"type": "status", "message": "Waiting for the model, you are next"}
+    assert [e[-1] for e in (one, two, three)] == [
+        {"type": "done", "content": f"Answer to {q}."} for q in ("first", "second", "third")
+    ]
+    assert t.bot.line.answering == set() and t.bot.line.waiting == []
+
+
+async def test_a_full_line_is_turned_away_before_streaming(make):
+    gate = asyncio.Event()
+    t = make(stream(say("Busy "), gate, say("done.")), say("Next."), concurrency=1, max_queue=1)
+    t.babamul.tokens.update({"bbml_two": "user-2", "bbml_three": "user-3"})
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app))
+    await until(lambda: t.model.requests)
+    second = asyncio.create_task(ask(app, token="bbml_two"))
+    await until(lambda: t.bot.line.waiting)
+
+    turned_away = await ask(app, token="bbml_three")
+    assert turned_away.status_code == 429 and turned_away.json() == {"error": a.LINE_FULL}
+    assert turned_away.headers["retry-after"] == "60"
+    assert not t.bot.limiter.hits["user-3"]  # a question never asked does not count
+    assert "user-3" not in t.bot.active
+
+    gate.set()
+    assert events(await first)[-1] == {"type": "done", "content": "Busy done."}
+    assert events(await second)[-1] == {"type": "done", "content": "Next."}
+
+
+async def test_waiting_too_long_in_line_ends_the_question(make):
+    gate = asyncio.Event()
+    t = make(stream(say("Busy "), gate, say("done.")), concurrency=1, queue_timeout=0.3)
+    t.babamul.tokens["bbml_two"] = "user-2"
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app))
+    await until(lambda: t.model.requests)
+    evs = events(await ask(app, token="bbml_two"))
+    assert evs == [
+        {"type": "status", "message": "Waiting for the model, you are next"},
+        {"type": "error", "message": a.WAITED_TOO_LONG},
+    ]
+    assert t.bot.line.waiting == [] and len(t.model.requests) == 1
+    gate.set()
+    assert events(await first)[-1]["type"] == "done"
+
+
+async def test_the_answer_clock_starts_when_the_question_reaches_the_model(make):
+    # Each answer takes 0.4 s of a 0.6 s clock, so the second, after 0.4 s in line, would run out of time.
+    t = make(lambda body: slowly("One ", "two.", pause=0.4), concurrency=1, answer_timeout=0.6)
+    t.babamul.tokens["bbml_two"] = "user-2"
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app))
+    await until(lambda: t.model.requests)
+    second = events(await ask(app, token="bbml_two"))
+    assert second[0]["type"] == "status"
+    assert second[-1] == {"type": "done", "content": "One two."}
+    assert events(await first)[-1] == {"type": "done", "content": "One two."}
+
+
+async def test_leaving_while_in_line_gives_up_the_place(make):
+    gate = asyncio.Event()
+    t = make(stream(say("Busy "), gate, say("done.")), say("never"), concurrency=1)
+    t.babamul.tokens["bbml_two"] = "user-2"
+    app = app_of(t.bot)
+    first = asyncio.create_task(ask(app))
+    await until(lambda: t.model.requests)
+
+    scope = {**SCOPE, "headers": [(b"authorization", b"Bearer bbml_two"), (b"content-type", b"application/json")]}
+    body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+    gone, sent, received = asyncio.Event(), [], iter([{"type": "http.request", "body": body, "more_body": False}])
+
+    async def receive():
+        if (message := next(received, None)) is not None:
+            return message
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if b"Waiting for the model" in message.get("body", b""):
+            gone.set()
+
+    await asyncio.wait_for(app(scope, receive, send), 3)
+    assert t.bot.line.waiting == [] and "user-2" not in t.bot.active
+    gate.set()
+    assert events(await first)[-1]["type"] == "done"
+    assert len(t.model.requests) == 1
+
+
+# The tool loop's clock, and replies that end badly.
+
+
+async def test_an_answer_running_past_the_tool_time_is_kept(make):
+    # Tools stop at 1.5 s; the answer started before that and ends at 1.7 s.
+    t = make(lambda body: slowly("Part one, ", "part two.", pause=1.7), answer_timeout=2.0)
+    evs = []
+    await t.bot.answer([{"role": "user", "content": "Tell me"}], None, "bbml_test", evs.append)
+    assert evs[-1] == {"type": "done", "content": "Part one, part two."}
+    assert len(t.model.requests) == 1  # not asked again without tools
+
+
+async def test_an_answer_cut_by_the_deadline_in_the_tool_loop_keeps_what_it_said(make):
+    t = make(stream(say("Part one, "), asyncio.Event()), answer_timeout=0.8)
+    evs = []
+    started = time.monotonic()
+    await t.bot.answer([{"role": "user", "content": "Tell me"}], None, "bbml_test", evs.append)
+    assert 0.7 < time.monotonic() - started < 1.5
+    assert evs[-2:] == [{"type": "text", "delta": a.CUT_SHORT}, {"type": "done", "content": "Part one," + a.CUT_SHORT}]
+    assert len(t.model.requests) == 1
+
+
+async def test_tool_calls_asked_for_after_the_tool_time_are_not_run(make):
+    async def late_call():
+        yield chunk({"content": "Let me check. "})
+        await asyncio.sleep(0.85)
+        for delta in use("convert_time"):
+            yield chunk(delta)
+        yield b"data: [DONE]\n\n"
+
+    t = make(late_call(), say("Final."), answer_timeout=1.0)
+    evs = []
+    await t.bot.answer([{"role": "user", "content": "What time is it?"}], None, "bbml_test", evs.append)
+    assert "tool_call" not in types(evs) and evs[-1] == {"type": "done", "content": "Final."}
+    final = t.model.requests[-1].body
+    assert "tools" not in final
+    assert final["messages"][-2]["content"] == "Not run: this question ran out of time for tools."
+    assert final["messages"][-1]["content"] == a.ANSWER_NOW and "cannot call tools" in a.ANSWER_NOW
+
+
+async def test_tool_markup_in_the_final_answer_is_dropped(make):
+    markup = "<tool_call>\n<function=convert_time>\n<parameter=value>\n2461351.5\n</parameter>\n</function>\n"
+    markup += "</tool_call>"
+    for final, shown in ((say(markup), a.NO_ANSWER), (say("It is late. ", markup[:30]), "It is late.")):
+        t = make(lambda body, final=final: use("convert_time") if has_tools(body) else final, max_tool_calls=1)
+        evs = []
+        await t.bot.answer([{"role": "user", "content": "What time is it?"}], None, "bbml_test", evs.append)
+        assert evs[-1] == {"type": "done", "content": shown}
+
+
+async def test_replies_have_a_length_limit_and_a_cut_answer_says_so(make):
+    def capped(body):
+        line = {"choices": [{"index": 0, "delta": {"content": "A long answer"}, "finish_reason": "length"}]}
+        return stream_bytes(f"data: {json.dumps(line)}\n\n".encode(), b"data: [DONE]\n\n")
+
+    t = make(capped)
+    evs = []
+    await t.bot.answer([{"role": "user", "content": "Tell me"}], None, "bbml_test", evs.append)
+    assert t.model.requests[0].body["max_tokens"] == 1024
+    assert evs[-2] == {"type": "text", "delta": a.TOO_LONG}
+    assert evs[-1] == {"type": "done", "content": "A long answer" + a.TOO_LONG}
+
+    t = make(say("Short."), max_tokens=0)
+    await t.bot.answer([{"role": "user", "content": "Tell me"}], None, "bbml_test", [].append)
+    assert "max_tokens" not in t.model.requests[0].body
+
+
+async def stream_bytes(*parts):
+    for part in parts:
+        yield part
+
+
+async def test_replies_that_are_not_a_finished_stream_fail(make, caplog):
+    # A proxy's page with a 200 is a failure, tried once more.
+    t = make(lambda body: httpx.Response(200, headers={"content-type": "text/html"}, text="<html>Log in</html>"))
+    with caplog.at_level(logging.WARNING, logger="boom_mcp.assistant"):
+        response = await ask(app_of(t.bot))
+    assert response.status_code == 503 and response.json() == {"error": a.UNREACHABLE}
+    assert len(t.model.requests) == 2 and "not a stream" in caplog.text
+
+    # An error event partway, as llama.cpp sends it, and a reply that just stops.
+    for broken in (
+        stream_bytes(
+            chunk({"content": "ZTF26aaaaaaa is a"}),
+            b'error: {"code": 500, "message": "out of memory"}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+        stream_bytes(chunk({"content": "ZTF26aaaaaaa is a"})),
+    ):
+        t = make(broken)
+        evs = events(await ask(app_of(t.bot)))
+        assert evs == [{"type": "text", "delta": "ZTF26aaaaaaa is a"}, {"type": "error", "message": a.STALLED}]
+
+
+def chunked(data: bytes) -> bytes:
+    return f"{len(data):x}\r\n".encode() + data + b"\r\n"
+
+
+async def socket_model(handler):
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1"
+
+
+HEAD = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+
+
+async def test_the_first_word_may_take_longer_than_the_stall_timeout(fake):
+    """A real socket: the model's queue and prompt reading come before any byte."""
+
+    async def busy(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        await asyncio.sleep(0.6)
+        writer.write(HEAD + chunked(chunk({"content": "Here."})) + chunked(b"data: [DONE]\n\n") + b"0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server, url = await socket_model(busy)
+    try:
+        cfg = a.Config(llm=a.Endpoint(url), stall_timeout=0.3)
+        async with httpx.AsyncClient() as http:
+            evs = []
+            await a.Assistant(cfg, http=http).answer([{"role": "user", "content": "hi"}], None, "bbml_test", evs.append)
+        assert evs[-1] == {"type": "done", "content": "Here."}
+    finally:
+        server.close()
+
+
+async def test_a_model_that_goes_quiet_before_a_word_is_not_asked_again(fake):
+    requests = []
+
+    async def quiet(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        requests.append(1)
+        writer.write(HEAD + chunked(chunk({"role": "assistant"})))
+        await writer.drain()
+        await asyncio.sleep(30)
+
+    server, url = await socket_model(quiet)
+    try:
+        cfg = a.Config(llm=a.Endpoint(url), stall_timeout=0.3)
+        async with httpx.AsyncClient() as http:
+            started = time.monotonic()
+            bot = a.Assistant(cfg, http=http)
+            with pytest.raises(a.ModelError) as failed:
+                await bot.answer([{"role": "user", "content": "hi"}], None, "bbml_test", [].append)
+        assert failed.value.message == a.STALLED and time.monotonic() - started < 2
+        assert len(requests) == 1
+    finally:
+        server.close()
+
+
+def test_a_long_table_keeps_its_header_and_newest_rows():
+    summary = json.dumps({"object_id": OBJECT, "n_points": 800, "listed": 800, "bands": {"ztfr": {"peak_mag": 17.6}}})
+    rows = [f"{2460000.5 + i},ztfr,18.0,0.05,,alert" for i in range(800)]
+    table = "jd,band,mag,magerr,limit,source\n" + "\n".join(rows) + "\n"
+    out = a.condense_blocks([summary, table], 20000)
+    first, note, header, *kept = out.split("\n")
+    assert json.loads(first) == json.loads(summary) and len(out) <= 20000
+    assert header == "jd,band,mag,magerr,limit,source" and kept[-1] == rows[-1]
+    assert note == f"(the {800 - len(kept)} oldest rows are not shown)" and 400 < len(kept) < 800
+    assert a.condense_blocks(["short", "text"], 100) == "short\ntext"
+
+    # The image note goes first, so shrinking an old result keeps it.
+    content = "[1 image shown to the person in the chat. You cannot see it.]\n" + out
+    messages = [{"role": "tool", "content": content}, {"role": "tool", "content": "x" * 100}]
+    a.fit(messages, 3000)
+    assert messages[0]["content"].startswith("[1 image shown") and len(messages[0]["content"]) < 2100
+
+
+# Tools and plugins.
+
+PLUGIN = '''
+import anyio
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
+
+from boom_mcp.app import tool
+
+
+@tool()
+async def chatty_probe(ctx: Context, n: int = 2) -> dict:
+    """Tells the client how it is doing."""
+    await ctx.info("starting")
+    await ctx.report_progress(1, n, "half way")
+    return {"done": n, "headers": ctx.headers}
+
+
+@tool()
+async def broken_probe(ctx: Context) -> dict:
+    """Always crashes."""
+    return {}["missing"]
+
+
+@tool()
+async def grouped_probe(ctx: Context) -> dict:
+    """Fails as expected, from inside a task group."""
+
+    async def fail():
+        raise ToolError("Babamul is busy. Try again in a minute.")
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(fail)
+    return {}
+'''
+
+
+@pytest.fixture
+def probes(tmp_path):
+    path = tmp_path / "probes.py"
+    path.write_text(PLUGIN)
+    plugins.load_file(str(path))
+    yield
+    for name in ("chatty_probe", "broken_probe", "grouped_probe"):
+        mcp.remove_tool(name)
+
+
+@pytest.mark.filterwarnings("ignore:The logging capability is deprecated")
+async def test_plugins_can_log_and_tool_crashes_are_logged(make, probes, caplog):
+    t = make(use("chatty_probe", {"n": 4}), use("broken_probe"), use("grouped_probe"), say("Done."))
+    evs = []
+    with caplog.at_level(logging.DEBUG, logger="boom_mcp.assistant"):
+        await t.bot.answer([{"role": "user", "content": "Try them"}], None, "bbml_test", evs.append)
+    results = [e for e in evs if e["type"] == "tool_result"]
+    assert [r["ok"] for r in results] == [True, False, False]
+    assert json.loads(results[0]["summary"]) == {"done": 4, "headers": None}
+    assert "tool log: starting" in caplog.text and "tool progress: 1 of 4 half way" in caplog.text
+
+    told = [m["content"] for m in t.model.requests[-1].body["messages"] if m["role"] == "tool"]
+    assert told[1].startswith("tool broken_probe crashed (KeyError: 'missing').")
+    assert told[2] == "tool grouped_probe failed: Babamul is busy. Try again in a minute."
+    crashes = [r for r in caplog.records if r.getMessage().startswith("tool broken_probe crashed")]
+    assert len(crashes) == 1 and crashes[0].exc_info and "KeyError" in caplog.text
+    assert not any(r.exc_info for r in caplog.records if "grouped_probe" in r.getMessage())
+    assert evs[-1] == {"type": "done", "content": "Done."}
+
+
+# Requests the assistant refuses before asking anyone.
+
+
+async def test_oversized_and_deeply_nested_bodies(make, monkeypatch):
+    t = make(say("never"))
+    app = app_of(t.bot)
+    headers = {"Authorization": "Bearer bbml_test"}
+    monkeypatch.setattr(a, "MAX_BODY", 5000)
+    sent = 0
+
+    async def endless():
+        nonlocal sent
+        for _ in range(100):
+            sent += 1
+            yield b"x" * 1000
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://boom") as client:
+        declared = await client.post("/assistant/chat", content=b"x" * 6000, headers=headers)
+        assert declared.status_code == 413 and "too long" in declared.json()["error"]
+        streamed = await client.post("/assistant/chat", content=endless(), headers=headers)
+        assert streamed.status_code == 413 and sent < 10  # stopped reading at the limit
+        monkeypatch.setattr(a, "MAX_BODY", 1_000_000)
+        nested = await client.post("/assistant/chat", content=b"[" * 100_000 + b"]" * 100_000, headers=headers)
+        assert nested.status_code == 400 and nested.json() == {"error": "The request body is not JSON."}
+    assert t.model.requests == [] and t.babamul.requests == []
+
+
+async def test_tokens_babamul_could_never_accept_are_not_sent_to_it(make):
+    t = make(say("never"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app_of(t.bot)), base_url="http://boom") as client:
+        for auth in (b"Bearer caf\xe9", b"Bearer two words", b"Bearer " + b"a" * 5000):
+            body = {"messages": [{"role": "user", "content": "hi"}]}
+            response = await client.post("/assistant/chat", json=body, headers={"Authorization": auth})
+            assert response.status_code == 401, auth
+    assert t.babamul.requests == []
+    assert a.TOKEN.fullmatch("bbml_" + "A1" * 18) and a.TOKEN.fullmatch("eyJhbGc.eyJzdWIi.c2lnbmF0dXJl")
+
+
+async def test_the_token_cache_stays_small(make, monkeypatch):
+    monkeypatch.setattr(a, "TOKEN_CACHE", 8)
+    t = make(say("never"))
+    for i in range(30):
+        assert await t.bot.person(f"bbml_bogus_{i}") is None
+    assert len(t.bot.tokens) <= 8
+    assert await t.bot.person("bbml_test") == "user-1"
+
+
+# Starting the server.
+
+
+def test_host_warning():
+    args = argparse.Namespace(allowed_host=[], cors_origin=[], host="127.0.0.1", port=8765)
+    assert "421" in host_warning(args) and "--allowed-host" in host_warning(args) and "8765" in host_warning(args)
+    args.cors_origin = ["https://chat.example.org"]
+    args.host = "0.0.0.0"
+    assert "421" in host_warning(args)  # any Host check allows only local names until told more
+    args.cors_origin = []
+    assert "accepts any Host" in host_warning(args)
+    args.allowed_host = ["babamul.umn.edu"]
+    assert host_warning(args) is None
+
+
+def test_main_warns_and_bounds_the_shutdown(monkeypatch, caplog, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ASSISTANT_ENABLED", raising=False)
+    monkeypatch.setitem(settings, "require_client_token", False)
+    monkeypatch.setattr(sys, "argv", ["boom-mcp", "--http", "--no-examples", "--port", "8765"])
+    ran = {}
+    monkeypatch.setattr(server.uvicorn, "run", lambda app, **kwargs: ran.update(kwargs))
+    with caplog.at_level(logging.WARNING, logger="boom_mcp.server"):
+        server.main()
+    assert ran["host"] == "127.0.0.1" and ran["timeout_graceful_shutdown"] == server.SHUTDOWN_GRACE
+    assert any("answers 421" in r.getMessage() for r in caplog.records)
+
+
+def test_now_line_names_last_nights_dates():
+    from boom_mcp import assistant
+
+    line = assistant.now_line()
+    assert '"Last night" means the last night that has ended' in line
+    assert "for ZTF 20" in line and "for LSST 20" in line
