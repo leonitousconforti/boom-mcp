@@ -52,8 +52,11 @@ async def main():
         _, xm = await call("question 3", "get_cross_matches", object_id=treasure)
         _, ex = await call("question 4", "estimate_explosion_time", object_id=treasure)
         _, obj = await call("question 5", "get_object", object_id=treasure)
-        r6, sim = await call("question 6", "find_similar_objects", object_id=treasure, top_k=3)
-        r7, fit = await call("question 7", "get_light_curve_fit", object_id=treasure)
+        _, around = await call("question 6", "cone_search", ra=obj["ra"], dec=obj["dec"], radius_arcsec=120)
+        neighbors = []
+        for o in [o for o in around["objects"] if o["object_id"] not in (treasure, signpost["object_id"])][:3]:
+            _, n = await call("question 6", "get_object", object_id=o["object_id"])
+            neighbors.append({"object_id": o["object_id"], "arcsec": o["separation_arcsec"], "flags": (n or {}).get("flags")})
 
         ml = (obj or {}).get("ml") or {}
         answers = {
@@ -62,9 +65,9 @@ async def main():
             "3 host": {"host": (obj or {}).get("host"), "NED": ((xm or {}).get("cross_matches") or {}).get("NED")},
             "4 began": {k: (ex or {}).get(k) for k in ("last_nondetection", "first_detection", "window_days")},
             "5 anomaly": (ml.get("applecider") or {}).get("out_of_distribution"),
-            "6 look-alike": (sim or {}).get("neighbors") if not r6.is_error else r6.content[0].text[:120],
-            "7 supernova fit": fit if not r7.is_error else r7.content[0].text[:120],
-            "debrief": {"btsbot": ml.get("btsbot"), "applecider": (ml.get("applecider") or {}).get("decision")},
+            "6 neighbors": neighbors,
+            "7 btsbot": ml.get("btsbot"),
+            "debrief": {"applecider": (ml.get("applecider") or {}).get("decision")},
         }
     print("\n=== Answer key from BOOM ===")
     print(json.dumps(answers, indent=1, default=str))

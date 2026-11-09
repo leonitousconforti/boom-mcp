@@ -296,7 +296,7 @@ def main(out: Path):
             "last_nondetection_utc": jd_to_dt(last_lim["jd"]).isoformat(),
             "n_detections": len(dets),
         },
-        "read_after_ingestion": ["applecider decision and out_of_distribution flag", "find_similar_objects neighbors", "Villar fit verdict"],
+        "read_after_ingestion": ["applecider decision and out_of_distribution flag", "nearest neighbors outside the hunt (cone_search, get_object)", "btsbot score"],
         "cleanup": "delete objectId ZTF26openeye and ZTF26rubinml (alerts, aux, cutouts, embeddings); every candid is >= 9e18",
         "files": [str(p.relative_to(out)) for p in written],
     }

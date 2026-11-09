@@ -29,8 +29,8 @@
  },
  "read_after_ingestion": [
   "applecider decision and out_of_distribution flag",
-  "find_similar_objects neighbors",
-  "Villar fit verdict"
+  "nearest neighbors outside the hunt (cone_search, get_object)",
+  "btsbot score"
  ],
  "cleanup": "delete objectId ZTF26openeye and ZTF26rubinml (alerts, aux, cutouts, embeddings); every candid is >= 9e18",
  "files": [
