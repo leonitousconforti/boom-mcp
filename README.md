@@ -116,8 +116,9 @@ This adds two routes next to `/mcp`, under `/assistant` (change it with `--assis
 
 The token is checked with Babamul's `GET /profile` before the model is asked, and the result is
 kept for 5 minutes. A missing or rejected token gets a 401, and so does one not shaped like a
-Bearer token, without asking Babamul. Each person can have one question running, and ask 20
-questions per 10 minutes; past that they get a 429.
+Bearer token, without asking Babamul. Each person has one question at a time: a new one stops
+the one running, which ends with an `error` event, or a 409 if its stream has not started. Each
+person can ask 20 questions per 10 minutes, replaced ones included; past that they get a 429.
 
 `ASSISTANT_CONCURRENCY` questions are answered at once, 2 by default. Set it to the number of
 slots the model server has (llama.cpp's `-np`), for example 8 on a dedicated instance. More would
