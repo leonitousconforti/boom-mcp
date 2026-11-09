@@ -22,12 +22,13 @@ import re
 import time
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 
 import anyio
 import httpx
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -43,7 +44,8 @@ alert broker. You are talking with an astronomer in a chat panel of the app.
 
 Use the tools to look things up rather than guessing; if the tools do not answer \
 the question, say so plainly. Be brief: this is a chat message, not a report. \
-Write object ids in full, exactly as the tools give them, so the app can link them."""
+Write object ids in full, exactly as the tools give them, so the app can link them. \
+Use plain punctuation: commas, colons or parentheses, never em dashes."""
 
 NO_VISION = """Images the tools return, such as cutouts and light-curve plots, \
 are shown to the person in the chat as soon as the tool finishes. You cannot see \
@@ -56,7 +58,10 @@ shown to the person in the chat as soon as the tool finishes, and you are given 
 them too. Describe only what you can actually see in them, and mention images \
 only when a tool result says it showed one."""
 
-ANSWER_NOW = "Answer now from what you have, and say what is still unknown."
+ANSWER_NOW = (
+    "You cannot call tools any more. Answer now, in plain text, from what you have, "
+    "and say what is still unknown."
+)
 
 # What the person reads when something goes wrong. Each says whether asking
 # again can help, because the person cannot tell otherwise.
@@ -71,6 +76,9 @@ BROKEN = "Something went wrong while looking that up. Try again."
 OUT_OF_TIME = "I ran out of time working that out. Please ask again, or narrow the question."
 NO_ANSWER = "I could not find an answer to that."
 CUT_SHORT = "\n\n(I ran out of time here, so this answer is cut short.)"
+TOO_LONG = "\n\n(This answer reached its length limit, so it is cut short.)"
+LINE_FULL = "The assistant is busy with other people's questions. Try again in a few minutes."
+WAITED_TOO_LONG = "The assistant is still busy with other people's questions. Try again in a few minutes."
 
 # The part of the answer timeout the tool loop may use. The rest is kept for the
 # final answer, so running out of time still ends in an answer.
@@ -83,6 +91,11 @@ SHRUNK_RESULT = 2000
 HEARTBEAT = 15.0
 TOKEN_TTL = 300.0
 BAD_TOKEN_TTL = 60.0
+# Tokens remembered at once. Past it the oldest go, so trying many tokens cannot grow it.
+TOKEN_CACHE = 4096
+# A Bearer token as RFC 6750 spells it. Babamul's API and login tokens both fit; anything
+# else Babamul would refuse, and a byte outside ASCII would crash the request to it.
+TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}=*")
 MAX_BODY = 1_000_000
 MAX_MESSAGE_CHARS = 20_000
 
@@ -112,7 +125,12 @@ class Config:
     result_budget: int = 20_000
     context_budget: int = 60_000
     max_messages: int = 30
-    concurrency: int = 4
+    max_tokens: int = 1024
+    # Questions answered at once. Match it to the model server's slots (llama.cpp -np):
+    # more would only queue inside the model, where nobody can tell how long the wait is.
+    concurrency: int = 2
+    queue_timeout: float = 300.0
+    max_queue: int = 20
     rate_limit: int = 20
     rate_window: float = 600.0
     fallback_period: float = 300.0
@@ -134,13 +152,16 @@ class Config:
             except ValueError:
                 raise ValueError(f"{name} must be a number, not {raw!r}") from None
 
+        def text(name):
+            # A trailing newline from an env file would otherwise reach the model's
+            # name or the Authorization header.
+            return env.get(name, "").strip()
+
         fallback = None
-        if fallback_url := env.get("ASSISTANT_FALLBACK_URL", "").strip():
-            fallback = Endpoint(
-                fallback_url, env.get("ASSISTANT_FALLBACK_MODEL", ""), env.get("ASSISTANT_FALLBACK_API_KEY", "")
-            )
+        if fallback_url := text("ASSISTANT_FALLBACK_URL"):
+            fallback = Endpoint(fallback_url, text("ASSISTANT_FALLBACK_MODEL"), text("ASSISTANT_FALLBACK_API_KEY"))
         return cls(
-            llm=Endpoint(url, env.get("ASSISTANT_LLM_MODEL", ""), env.get("ASSISTANT_LLM_API_KEY", "")),
+            llm=Endpoint(url, text("ASSISTANT_LLM_MODEL"), text("ASSISTANT_LLM_API_KEY")),
             fallback=fallback,
             vision=env_flag(env.get("ASSISTANT_LLM_VISION")),
             thinking=env_flag(env.get("ASSISTANT_THINKING")),
@@ -150,7 +171,10 @@ class Config:
             result_budget=number("ASSISTANT_RESULT_BUDGET", cls.result_budget),
             context_budget=number("ASSISTANT_CONTEXT_BUDGET", cls.context_budget),
             max_messages=number("ASSISTANT_MAX_MESSAGES", cls.max_messages),
+            max_tokens=number("ASSISTANT_MAX_TOKENS", cls.max_tokens),
             concurrency=number("ASSISTANT_CONCURRENCY", cls.concurrency),
+            queue_timeout=number("ASSISTANT_QUEUE_TIMEOUT", cls.queue_timeout),
+            max_queue=number("ASSISTANT_MAX_QUEUE", cls.max_queue),
             rate_limit=number("ASSISTANT_RATE_LIMIT", cls.rate_limit),
             rate_window=number("ASSISTANT_RATE_WINDOW", cls.rate_window),
         )
@@ -170,9 +194,18 @@ def now_line() -> str:
     and then searches a night with no alerts.
     """
     jd = s.now_jd()
+    nights = []
+    for survey in s.NIGHTS_UTC:
+        w = s.night_windows(survey)
+        last = w["last_night"]
+        text = f"for {survey} {last['start']} to {last['end']}"
+        if "tonight_so_far" in w:
+            text += f" (tonight's {survey} night began at {w['tonight_so_far']['start']})"
+        nights.append(text)
     return (
         f"The time is {s.jd_to_iso(jd)[:16].replace('T', ' ')} UTC, which is JD {jd:.4f}. "
-        "Any window you pass to a tool should be near it."
+        "Any window you pass to a tool should be near it. "
+        f"\"Last night\" means the last night that has ended: {'; '.join(nights)} (UTC)."
     )
 
 
@@ -315,14 +348,70 @@ def _shrunk(value, budget):
     return _reparsed(condense(json.dumps(value, default=str), budget))
 
 
-def chat_payload(model, messages, tools, thinking=False) -> dict:
+def condense_table(text: str, budget: int) -> str | None:
+    """A CSV table cut to its header and its newest rows, or None if text is not one.
+
+    Tables come oldest row first (a light curve sorted by time), and the newest
+    rows are the ones a question is usually about.
+    """
+    lines = text.rstrip("\n").split("\n")
+    header, rows = lines[0], lines[1:]
+    commas = header.count(",")
+    if len(rows) < 2 or not commas or any(row.count(",") != commas for row in rows[:5]):
+        return None
+    kept, size = [], len(header) + 60
+    for row in reversed(rows):
+        if size + len(row) + 1 > budget:
+            break
+        kept.append(row)
+        size += len(row) + 1
+    return "\n".join([f"(the {len(rows) - len(kept)} oldest rows are not shown)", header, *reversed(kept)])
+
+
+def condense_blocks(texts: list[str], budget: int) -> str:
+    """Fit the text blocks of one tool result into budget, each cut down on its own.
+
+    get_light_curve returns a JSON summary and then a CSV table. Cut as one
+    text, the table would keep its oldest rows and lose its newest. As in
+    condense(), small blocks stay whole and the big ones share what is left.
+    """
+    joined = "\n".join(texts)
+    if len(joined) <= budget:
+        return joined
+    room = budget - len(texts) + 1
+    cap = room
+    for i, size in enumerate(sorted(len(t) for t in texts)):
+        if size * (len(texts) - i) > room:
+            cap = room // (len(texts) - i)
+            break
+        room -= size
+    return "\n".join(t if len(t) <= cap else condense_table(t, cap) or condense(t, cap) for t in texts)
+
+
+# A tool call written out as text. llama.cpp parses these only when tools are
+# offered, so one in the final round would reach the person as markup.
+TOOL_MARKUP = re.compile(r"<tool_call>.*?(?:</tool_call>|$)", re.S)
+
+
+def strip_tool_markup(text: str | None) -> str:
+    return TOOL_MARKUP.sub("", text or "").strip()
+
+
+def chat_payload(model, messages, tools, thinking=False, max_tokens=0) -> dict:
     """The body of a chat-completions request.
 
     `tools` is omitted when empty rather than sent as []: the last round asks
     for an answer with no tools left to call, and a server that rejects an
     empty array turns that into a 400.
+
+    max_tokens is what stops a reply that repeats itself: greedy decoding can
+    loop, and the stall timeout never fires while it keeps talking. There is no
+    repetition penalty, because it would also stop the model from writing an
+    object id exactly as a tool gave it.
     """
     payload = {"model": model, "messages": messages, "temperature": 0}
+    if max_tokens > 0:
+        payload["max_tokens"] = max_tokens
     if tools:
         payload["tools"] = tools
     if not thinking:
@@ -379,15 +468,49 @@ def openai_tool(tool) -> dict:
     }
 
 
-def split_content(result) -> tuple[str, list[dict]]:
-    """A tool result as the text the model reads and the images the person sees."""
+def split_content(result) -> tuple[list[str], list[dict]]:
+    """A tool result as the texts the model reads and the images the person sees."""
     texts, images = [], []
     for block in result.content:
         if block.type == "text":
             texts.append(block.text)
         elif block.type == "image":
             images.append({"mime_type": block.mime_type, "data": block.data})
-    return "\n".join(texts), images
+    return texts, images
+
+
+LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "notice": logging.INFO, "warning": logging.WARNING}
+
+
+class LocalContext(Context):
+    """The Context a tool gets when the assistant calls it in this process.
+
+    No MCP client is listening, so the plain Context refuses ctx.info() and
+    ctx.report_progress() and the tool crashes. Here they go to the log instead,
+    and a plugin works the same in the assistant as over /mcp.
+    """
+
+    async def log(self, level, data, *, logger_name=None) -> None:
+        log.log(LOG_LEVELS.get(level, logging.ERROR), "tool log%s: %s", f" {logger_name}" if logger_name else "", data)
+
+    async def report_progress(self, progress, total=None, message=None) -> None:
+        log.debug("tool progress: %s of %s %s", progress, total, message or "")
+
+    @property
+    def headers(self):
+        # As over stdio: the tool runs with no HTTP request of its own.
+        return None
+
+
+def crash_cause(exc: BaseException) -> BaseException:
+    """What a tool really raised, under the SDK's wrapper and any task group."""
+    while True:
+        if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+            exc = exc.exceptions[0]
+        elif isinstance(exc, UnexpectedToolError) and exc.__cause__ is not None:
+            exc = exc.__cause__
+        else:
+            return exc
 
 
 def image_message(images: list[dict]) -> dict:
@@ -422,12 +545,18 @@ class OutOfTime(Exception):
         self.said = said
 
 
+class Stalled(Exception):
+    """The model went quiet partway through its reply."""
+
+
 class BabamulDown(Exception):
     pass
 
 
 class BadRequest(Exception):
-    pass
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -473,6 +602,68 @@ class RateLimiter:
             hits.pop()
 
 
+class Place:
+    """One question's place: answering, or waiting in line."""
+
+    def __init__(self):
+        self.admitted = False
+        self.moved = asyncio.Event()
+
+
+class Line:
+    """The questions being answered, at most `capacity`, and the line of those
+    waiting to start, first come first served.
+
+    A question keeps its place for its whole answer, tool calls included. Taking
+    turns for each model round instead turned a burst into round-robin: twenty
+    questions each got one round in turn, and all of them ran out of time
+    together. The cost is a model slot left idle while a question's tools run:
+    usually a few seconds, though a slow alert search can take a minute. In
+    exchange every question let in can finish, and llama.cpp keeps its prompt
+    cached in the slot, so the next round does not read the whole prompt again.
+    """
+
+    def __init__(self, capacity: int, max_waiting: int):
+        self.capacity = max(1, capacity)
+        self.max_waiting = max(0, max_waiting)
+        self.answering: set[Place] = set()
+        self.waiting: list[Place] = []
+
+    def join(self) -> Place | None:
+        """A place for a new question, or None when the line is full."""
+        place = Place()
+        if len(self.answering) < self.capacity and not self.waiting:
+            place.admitted = True
+            self.answering.add(place)
+        elif len(self.waiting) < self.max_waiting:
+            self.waiting.append(place)
+        else:
+            return None
+        return place
+
+    def ahead(self, place: Place) -> int:
+        return self.waiting.index(place)
+
+    def leave(self, place: Place):
+        """Give up a place, answering or waiting, and let the next in line start."""
+        self.answering.discard(place)
+        if place in self.waiting:
+            self.waiting.remove(place)
+        moved = list(self.waiting)
+        while self.waiting and len(self.answering) < self.capacity:
+            first = self.waiting.pop(0)
+            first.admitted = True
+            self.answering.add(first)
+        for other in moved:
+            other.moved.set()
+
+
+def waiting_message(ahead: int) -> str:
+    if not ahead:
+        return "Waiting for the model, you are next"
+    return f"Waiting for the model, {ahead} question{'s' * (ahead > 1)} ahead of you"
+
+
 class EventStream(StreamingResponse):
     """A stream of events that stops the question as soon as the client leaves.
 
@@ -515,7 +706,7 @@ class Assistant:
         self.config = config
         self.http = http
         self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
-        self.sem = asyncio.Semaphore(max(1, config.concurrency))
+        self.line = Line(config.concurrency, config.max_queue)
         self.limiter = RateLimiter(config.rate_limit, config.rate_window)
         # Person -> (ticket, start) of their running question.
         self.active: dict[str, tuple[object, float]] = {}
@@ -543,14 +734,17 @@ class Assistant:
         return JSONResponse({"status": "ok", "model": self.config.llm.model, "vision": self.config.vision})
 
     async def chat(self, request: Request):
-        try:
-            messages, context = parse_body(await request.body())
-        except BadRequest as exc:
-            return error(400, str(exc))
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         if not token:
             return error(401, "Log in to Babamul to use the assistant.")
+        if not TOKEN.fullmatch(token):
+            # Babamul would refuse it, so it is not asked.
+            return error(401, "Babamul did not accept your login. Log in again.")
+        try:
+            messages, context = parse_body(await read_body(request))
+        except BadRequest as exc:
+            return error(exc.status, str(exc))
         try:
             person = await self.person(token)
         except BabamulDown:
@@ -567,14 +761,21 @@ class Assistant:
                 f"That is a lot of questions in a short time. Try again in {minutes} minute{'s' * (minutes > 1)}.",
                 headers={"Retry-After": str(math.ceil(wait))},
             )
+        # Taken here, before anything awaits, so a burst cannot overfill the line.
+        if (place := self.line.join()) is None:
+            self.limiter.refund(person)
+            log.warning("turned user %s away: %d questions already waiting", person, len(self.line.waiting))
+            return error(429, LINE_FULL, headers={"Retry-After": "60"})
 
         ticket = object()
         self.active[person] = (ticket, time.monotonic())
         queue: asyncio.Queue = asyncio.Queue()
-        task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait))
+        task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place))
 
         def close():
             task.cancel()
+            # Also here: a task cancelled before it starts never runs its own cleanup.
+            self.line.leave(place)
             if self.active.get(person, (None,))[0] is ticket:
                 del self.active[person]
 
@@ -659,15 +860,18 @@ class Assistant:
                 raise BabamulDown("profile is not JSON") from exc
             data = body.get("data", body) if isinstance(body, dict) else {}
             person, ttl = str((data or {}).get("id") or key), TOKEN_TTL
-        if len(self.tokens) > 4096:
+        if len(self.tokens) >= TOKEN_CACHE:
             self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
+            if len(self.tokens) >= TOKEN_CACHE:
+                self.tokens = dict(list(self.tokens.items())[TOKEN_CACHE // 2 :])
         self.tokens[key] = (now + ttl, person)
         return person
 
     def busy(self, person: str) -> bool:
         entry = self.active.get(person)
-        # A question past its own timeout is gone, whatever its bookkeeping says.
-        return entry is not None and time.monotonic() - entry[1] < self.config.answer_timeout + 30
+        # A question past its own timeouts is gone, whatever its bookkeeping says.
+        limit = self.config.queue_timeout + self.config.answer_timeout + 30
+        return entry is not None and time.monotonic() - entry[1] < limit
 
     async def idle(self, person: str) -> bool:
         """Whether person has no question running, after a moment for one just stopped."""
@@ -680,12 +884,23 @@ class Assistant:
 
     # Answering.
 
-    async def run(self, messages, context, token, person, emit):
-        """Answer one question, every event and then None into emit."""
+    async def run(self, messages, context, token, person, emit, place: Place):
+        """Answer one question once it has its turn, every event and then None into emit."""
         started = time.monotonic()
         try:
+            if not await self.wait_turn(place, emit):
+                log.warning("user %s gave up waiting in line after %.0f s", person, time.monotonic() - started)
+                emit(Failure(429, WAITED_TOO_LONG))
+                return
+            waited = time.monotonic() - started
             calls = await self.answer(messages, context, token, emit)
-            log.info("answered user %s in %.1f s with %d tool calls", person, time.monotonic() - started, calls)
+            log.info(
+                "answered user %s in %.1f s (%.1f s in line) with %d tool calls",
+                person,
+                time.monotonic() - started,
+                waited,
+                calls,
+            )
         except ModelError as exc:
             log.warning("model failed for user %s: %s", person, exc)
             emit(Failure(503, exc.message))
@@ -693,7 +908,25 @@ class Assistant:
             log.exception("the assistant failed for user %s", person)
             emit(Failure(500, BROKEN))
         finally:
+            self.line.leave(place)
             emit(None)
+
+    async def wait_turn(self, place: Place, emit) -> bool:
+        """Wait for place to reach the model, telling the person where they are in
+        line. False when that takes longer than the queue timeout."""
+        give_up = time.monotonic() + self.config.queue_timeout
+        while not place.admitted:
+            if (left := give_up - time.monotonic()) <= 0:
+                return False
+            emit({"type": "status", "message": waiting_message(self.line.ahead(place))})
+            place.moved.clear()
+            try:
+                # Said again now and then, or the heartbeat's "Still working" replaces it.
+                async with asyncio.timeout(min(left, HEARTBEAT / 2)):
+                    await place.moved.wait()
+            except TimeoutError:
+                pass
+        return True
 
     async def tools(self) -> list[dict]:
         """The read-only tools, as the chat API wants them."""
@@ -711,34 +944,54 @@ class Assistant:
         offered = {t["function"]["name"] for t in tools}
         cfg = self.config
         convo = [{"role": "system", "content": system_prompt(context, cfg.vision)}, *messages[-cfg.max_messages :]]
+        # The question has its place on the model by now, so time spent in line
+        # is not taken from its answer.
         start = time.monotonic()
         deadline = start + cfg.answer_timeout
         tools_until = start + cfg.answer_timeout * TOOL_SHARE
+
+        def finish(text, note="", empty=NO_ANSWER):
+            text = strip_tool_markup(text)
+            if not text:
+                text = empty
+            elif note:
+                # Say so, or a sentence cut off mid-word reads like the whole answer.
+                emit({"type": "text", "delta": note})
+                text += note
+            emit({"type": "done", "content": text})
+
+        def ending(message):
+            return TOO_LONG if message.pop("finish_reason", None) == "length" else ""
 
         reset = caller.set(Babamul(self.http, token, self.babamul_url))
         try:
             # One round can ask for several tools at once, so count the calls
             # themselves. Counting rounds lets a paging model run on and on.
             calls_made = 0
-            while calls_made < cfg.max_tool_calls:
-                if (left := tools_until - time.monotonic()) <= 0:
-                    break
+            while calls_made < cfg.max_tool_calls and time.monotonic() < tools_until:
                 try:
-                    message = await self.round(convo, tools, left, emit)
-                except OutOfTime:
+                    message = await self.round(convo, tools, tools_until, emit, talking_until=deadline)
+                except OutOfTime as exc:
+                    if strip_tool_markup(exc.said):
+                        # It was answering, and ran on to the deadline: keep what it said.
+                        finish(exc.said, CUT_SHORT)
+                        return calls_made
                     break
+                note = ending(message)
                 calls = message.get("tool_calls") or []
                 if not calls:
-                    emit({"type": "done", "content": (message.get("content") or "").strip() or NO_ANSWER})
+                    finish(message.get("content"), note)
                     return calls_made
                 for call in calls:
                     call["id"] = call["id"] or f"call_{uuid.uuid4().hex[:12]}"
                 convo.append(message)
                 seen = []
                 for call in calls:
+                    # Every call needs an answer, or the server refuses the next round.
                     if calls_made >= cfg.max_tool_calls:
-                        # Every call needs an answer, or the server refuses the next round.
                         content = "Not run: this question reached its limit of tool calls."
+                    elif time.monotonic() >= tools_until:
+                        content = "Not run: this question ran out of time for tools."
                     else:
                         calls_made += 1
                         content, images = await self.call(call, offered, tools_until, emit)
@@ -751,15 +1004,10 @@ class Assistant:
             # or the model asks for another instead of answering.
             convo.append({"role": "user", "content": ANSWER_NOW})
             try:
-                message = await self.round(convo, [], deadline - time.monotonic(), emit)
-                text = (message.get("content") or "").strip() or NO_ANSWER
+                message = await self.round(convo, [], deadline, emit)
+                finish(message.get("content"), ending(message))
             except OutOfTime as exc:
-                text = OUT_OF_TIME
-                if exc.said.strip():
-                    # Say so, or a sentence cut off mid-word reads like the whole answer.
-                    emit({"type": "text", "delta": CUT_SHORT})
-                    text = exc.said.strip() + CUT_SHORT
-            emit({"type": "done", "content": text})
+                finish(exc.said, CUT_SHORT, empty=OUT_OF_TIME)
             return calls_made
         finally:
             caller.reset(reset)
@@ -775,20 +1023,22 @@ class Assistant:
             arguments = None
         emit({"type": "tool_call", "id": call_id, "name": name, "arguments": arguments or {}})
 
-        text, images, ok = "", [], False
+        texts, images, ok = [], [], False
         try:
             if arguments is None:
                 raise ToolError("its arguments were not a JSON object")
             if name not in offered:
                 raise ToolError(f"there is no tool called {name}")
+            context = LocalContext(mcp_server=mcp, subscriptions=getattr(mcp, "_subscriptions", None))
             async with asyncio.timeout(until - time.monotonic()):
-                result = await mcp.call_tool(name, arguments)
-            text, images = split_content(result)
+                result = await mcp.call_tool(name, arguments, context)
+            texts, images = split_content(result)
             ok = not result.is_error
         except TimeoutError:
-            text = f"tool {name} ran out of time and was stopped"
+            texts = [f"tool {name} ran out of time and was stopped"]
         except Exception as exc:
-            text = f"tool {name} failed: {exc}"
+            texts = [self.failure_text(name, exc)]
+        text = "\n".join(texts)
         emit(
             {
                 "type": "tool_result",
@@ -799,15 +1049,34 @@ class Assistant:
                 "images": images,
             }
         )
-        content = condense(text, self.config.result_budget)
+        content = condense_blocks(texts, self.config.result_budget)
         if images:
+            # First, so that cutting an old result down to fit keeps it.
             n = f"{len(images)} image{'s' * (len(images) > 1)}"
-            content += (
-                f"\n[{n} shown to the person in the chat, and attached below for you.]"
+            note = (
+                f"[{n} shown to the person in the chat, and attached below for you.]"
                 if self.config.vision
-                else f"\n[{n} shown to the person in the chat. You cannot see {'them' if len(images) > 1 else 'it'}.]"
+                else f"[{n} shown to the person in the chat. You cannot see {'them' if len(images) > 1 else 'it'}.]"
             )
+            content = f"{note}\n{content}"
         return content, images
+
+    @staticmethod
+    def failure_text(name: str, exc: Exception) -> str:
+        """What the model reads about a tool that failed, and the log line for a crash.
+
+        The SDK wraps a crash so that only "Error executing tool X" is left, and
+        the assistant calls tools without the MCP handler that would log it.
+        """
+        cause = crash_cause(exc)
+        if isinstance(cause, ToolError):
+            # Anticipated, such as Babamul answering 503, maybe from inside a task group.
+            log.info("tool %s failed: %s", name, cause)
+            message = str(cause)
+            return message if message.startswith(f"Error executing tool {name}") else f"tool {name} failed: {message}"
+        log.error("tool %s crashed", name, exc_info=exc)
+        detail = f"{type(cause).__name__}: {cause}"[:200]
+        return f"tool {name} crashed ({detail}). Calling it again with the same arguments will fail the same way."
 
     def endpoints(self) -> list[Endpoint]:
         """Where to send one round, in the order to try them."""
@@ -818,30 +1087,47 @@ class Assistant:
             return [fallback, main]
         return [main, fallback]
 
-    async def round(self, messages, tools, budget, emit) -> dict:
+    async def round(self, messages, tools, until, emit, talking_until=None) -> dict:
         """One model round, moved to the other endpoint if the first fails before saying anything.
 
-        Raises OutOfTime when budget runs out, and ModelError when no endpoint answers.
+        Raises OutOfTime when the clock reaches until, and ModelError when no
+        endpoint answers. A round that has started to answer in text may run on
+        to talking_until: cutting it at until would throw away an answer the
+        person is watching arrive, and ask for it again with less time.
         """
         fit(messages, self.config.context_budget)
-        deadline = time.monotonic() + budget
         failure: ModelError | None = None
+        tried, again = None, True
         for endpoint in self.endpoints():
-            if (left := deadline - time.monotonic()) <= 0:
+            if endpoint is tried and not again:
                 break
-            said: list[str] = []
+            if (left := until - time.monotonic()) <= 0:
+                break
+            tried, said = endpoint, []
             try:
-                async with asyncio.timeout(left):
-                    async with self.slot(emit):
-                        return await self.stream(endpoint, messages, tools, emit, said)
+                async with asyncio.timeout(left) as timer:
+                    extend = None
+                    if talking_until is not None and talking_until > until:
+                        later = timer.when() + talking_until - until
+
+                        def extend():
+                            timer.reschedule(later)
+
+                    return await self.stream(endpoint, messages, tools, emit, said, extend)
             except TimeoutError:
                 raise OutOfTime("".join(said)) from None
+            except Stalled as exc:
+                if said:
+                    raise ModelError(STALLED, detail=str(exc)) from None
+                # Not asked again where it went quiet: that request may still be
+                # running there, and a second one would wait behind it.
+                failure, again = ModelError(STALLED, switchable=True, detail=str(exc)), False
             except ModelError as exc:
                 if not exc.switchable or said:
                     raise
                 failure = exc
             except httpx.TransportError as exc:
-                # Unreachable, or silent for longer than the stall timeout.
+                # Unreachable, or the connection broke.
                 if said:
                     raise ModelError(STALLED, detail=repr(exc)) from exc
                 failure = ModelError(UNREACHABLE, switchable=True, detail=repr(exc))
@@ -852,27 +1138,27 @@ class Assistant:
             raise failure
         raise OutOfTime()
 
-    @asynccontextmanager
-    async def slot(self, emit):
-        """One of the model calls allowed at once."""
-        if self.sem.locked():
-            emit({"type": "status", "message": "Waiting for the model"})
-        async with self.sem:
-            yield
+    async def stream(self, endpoint: Endpoint, messages, tools, emit, said: list[str], on_text=None) -> dict:
+        """One streamed chat completion, its text emitted as it arrives.
 
-    async def stream(self, endpoint: Endpoint, messages, tools, emit, said: list[str]) -> dict:
-        """One streamed chat completion, its text emitted as it arrives."""
-        payload = {**chat_payload(endpoint.model, messages, tools, self.config.thinking), "stream": True}
+        on_text is called when the first text arrives. The message returned also
+        has the reply's finish_reason, which the caller takes out.
+        """
+        cfg = self.config
+        payload = {**chat_payload(endpoint.model, messages, tools, cfg.thinking, cfg.max_tokens), "stream": True}
         headers = {"Accept": "text/event-stream"}
         if endpoint.api_key:
             headers["Authorization"] = f"Bearer {endpoint.api_key}"
-        stall = self.config.stall_timeout
+        stall = cfg.stall_timeout
         async with self.http.stream(
             "POST",
             f"{endpoint.base_url.rstrip('/')}/chat/completions",
             json=payload,
             headers=headers,
-            timeout=httpx.Timeout(stall, connect=min(10.0, stall)),
+            # No read timeout here. Before its first byte the request waits in the
+            # model server's own queue and then for its prompt to be read, which
+            # only the round's clock limits. Silence after that is a stall, below.
+            timeout=httpx.Timeout(None, connect=min(10.0, stall), write=stall),
         ) as response:
             if response.status_code >= 400:
                 # The status alone says nothing: a refused request looks the same
@@ -888,35 +1174,83 @@ class Assistant:
                     len(json.dumps(messages)) + len(json.dumps(tools)),
                 )
                 raise refused(response.status_code, f"{response.status_code} {detail}")
+            kind = response.headers.get("content-type", "")
+            if not kind.startswith("text/event-stream"):
+                # A proxy's login or error page, sent with a 200.
+                detail = (await response.aread())[:300].decode(errors="replace")
+                log.warning("model at %s answered %r, not a stream: %s", endpoint.base_url, kind, detail)
+                raise ModelError(UNREACHABLE, switchable=True, detail=f"content-type {kind!r}")
             emit({"type": "_started"})
-            deltas = []
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
-                if chunk.get("error"):
-                    raise ModelError(STALLED, switchable=not said, detail=str(chunk["error"])[:300])
-                for choice in (chunk.get("choices") or [])[:1]:
-                    delta = choice.get("delta") or {}
-                    deltas.append(delta)
-                    if text := delta.get("content"):
-                        said.append(text)
-                        emit({"type": "text", "delta": text})
-        return merge_deltas(deltas)
+            deltas, finish, ended, started = [], None, False, False
+            async with aclosing(response.aiter_lines()) as lines:
+                while True:
+                    try:
+                        if started:
+                            async with asyncio.timeout(stall):
+                                line = await anext(lines)
+                        else:
+                            line = await anext(lines)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        raise Stalled(f"silent for {stall:g} s") from None
+                    started = True
+                    if line.startswith("error:"):
+                        # How llama.cpp reports a failure partway through a reply.
+                        raise ModelError(STALLED, switchable=not said, detail=line[6:].strip()[:300])
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        ended = True
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    if chunk.get("error"):
+                        raise ModelError(STALLED, switchable=not said, detail=str(chunk["error"])[:300])
+                    for choice in (chunk.get("choices") or [])[:1]:
+                        finish = choice.get("finish_reason") or finish
+                        delta = choice.get("delta") or {}
+                        deltas.append(delta)
+                        if text := delta.get("content"):
+                            if not said and on_text is not None:
+                                on_text()
+                            said.append(text)
+                            emit({"type": "text", "delta": text})
+        if not ended and finish is None:
+            # A reply that just stops was cut off on the way, whatever its status said.
+            log.warning("model at %s stopped its reply without finishing it (%d chunks)", endpoint.base_url, len(deltas))
+            raise ModelError(STALLED, switchable=not said, detail="the reply ended early")
+        if not deltas:
+            log.warning("model at %s sent an empty reply", endpoint.base_url)
+        message = merge_deltas(deltas)
+        message["finish_reason"] = finish
+        return message
+
+
+async def read_body(request: Request) -> bytes:
+    """The request body, refused as soon as it is too long rather than once it is all in memory."""
+    too_long = BadRequest("The conversation is too long. Start a new chat.", 413)
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY:
+        raise too_long
+    body = bytearray()
+    async for part in request.stream():
+        body += part
+        if len(body) > MAX_BODY:
+            raise too_long
+    return bytes(body)
 
 
 def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
     if len(raw) > MAX_BODY:
-        raise BadRequest("The conversation is too long. Start a new chat.")
+        raise BadRequest("The conversation is too long. Start a new chat.", 413)
     try:
         body = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deep nesting runs out of recursion before it is found not to be a conversation.
         raise BadRequest("The request body is not JSON.") from None
     if not isinstance(body, dict):
         raise BadRequest("The request body must be a JSON object.")

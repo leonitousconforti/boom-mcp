@@ -2,6 +2,7 @@
 
 import base64
 import math
+import os
 import time
 from typing import Annotated, Literal
 
@@ -13,7 +14,7 @@ from pydantic import Field
 from . import plots
 from . import summarize as s
 from .app import INSTRUCTIONS, babamul, mcp, tool
-from .babamul import BabamulError
+from .babamul import BabamulError, checked_object_id
 
 Survey = Literal["ZTF", "LSST"]
 AppleCiderClass = Literal[
@@ -33,11 +34,30 @@ PAGE_SIZE = 5000
 # hour returns in about a second, so time searches go out one UTC hour at a time.
 MAX_WINDOW_DAYS = 1.0
 CONCURRENCY = 3
-# Babamul serves the same public data to every user, so hour chunks can be shared
-# between callers; a room of people asking about "last night" then costs one fetch.
+
+# Finished hours are cached for a while, including hours cut short by the budget,
+# which a later search with the same or a smaller budget can use. An entry
+# belongs to the token that fetched it, so one person never sees what was
+# fetched for another, unless BOOM_MCP_SHARED_ALERT_CACHE is on.
 CACHE_TTL_S = 600
-CACHE_SIZE = 64
-_cache: dict[tuple, tuple[float, list]] = {}
+CACHE_SIZE = 256
+# Alerts held across all entries. A cut-down alert is a few KB in memory, and
+# one uncut ZTF hour is about 20,000 alerts.
+CACHE_MAX_ALERTS = 200_000
+# key -> (stored at, alerts, whether that is every alert of the window)
+_cache: dict[tuple, tuple[float, list, bool]] = {}
+_inflight: dict[tuple, "_Flight"] = {}
+
+# What search_alerts reads of an alert: the window filter, the sort keys and
+# summarize.alert_row. A full candidate has about 100 fields.
+CANDIDATE_FIELDS = frozenset(
+    "jd ra dec magpsf sigmapsf drb reliability fid band isdiffpos isNegative ndethist jdstarthist".split()
+)
+PROPERTY_FIELDS = frozenset("star rock near_brightstar stationary hosted sso best_host".split())
+
+# matplotlib's caches are not built for several threads drawing at once, and
+# drawing holds the GIL anyway, so renders run one at a time, off the event loop.
+_render_limiter = anyio.CapacityLimiter(1)
 
 
 def _check_ml(survey: str, *requested):
@@ -58,26 +78,103 @@ def _hours(start_jd: float, end_jd: float) -> list[tuple[float, float]]:
     return [(0.5 + h / 24, 0.5 + (h + 1) / 24) for h in range(first, last)]
 
 
-async def _fetch(bm, survey: str, params: dict, start_jd, end_jd, budget: int) -> list:
-    """Every alert matching params in one window, page by page, up to budget."""
-    key = (bm.base_url, survey, tuple(sorted(params.items())), start_jd, end_jd)
-    if (hit := _cache.get(key)) and time.monotonic() - hit[0] < CACHE_TTL_S:
-        return hit[1][:budget]
-    alerts, skip = [], 0
-    while len(alerts) < budget:
-        page_size = min(PAGE_SIZE, budget - len(alerts))
-        page = await bm.get(
-            f"/surveys/{survey}/alerts", **params, start_jd=start_jd, end_jd=end_jd, limit=page_size, skip=skip
-        )
-        alerts.extend(page)
-        skip += len(page)
-        if len(page) < page_size:
-            if start_jd is not None and end_jd is not None and end_jd < s.now_jd():
-                if len(_cache) >= CACHE_SIZE:
-                    _cache.pop(next(iter(_cache)))
-                _cache[key] = (time.monotonic(), alerts)
+def _shared_cache() -> bool:
+    """Whether cached alerts are shared between tokens (BOOM_MCP_SHARED_ALERT_CACHE=1).
+
+    Safe today: Babamul's alert search never reads who is asking (BOOM
+    src/api/routes/babamul/surveys/alerts.rs:113-118 leaves _current_user unused)
+    and forces public data (candidate.programid 1, alerts.rs:131-135), so every
+    token gets the same alerts. Sharing lets a room asking the same question at
+    once cost one fetch. Off by default in case Babamul starts answering per user.
+    """
+    return os.environ.get("BOOM_MCP_SHARED_ALERT_CACHE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _slim(alert: dict) -> dict:
+    """alert with only the fields search_alerts reads, so cached hours stay small."""
+    out = {k: alert[k] for k in ("candid", "_id", "objectId", "object_id", "classifications") if k in alert}
+    out["candidate"] = {k: v for k, v in (alert.get("candidate") or {}).items() if k in CANDIDATE_FIELDS}
+    if (props := alert.get("properties")) is not None:
+        out["properties"] = {k: v for k, v in props.items() if k in PROPERTY_FIELDS}
+    return out
+
+
+def _store(key: tuple, alerts: list, complete: bool):
+    """Cache alerts under key, dropping expired entries, then the oldest, to stay within bounds."""
+    now = time.monotonic()
+    for k in [k for k, entry in _cache.items() if now - entry[0] >= CACHE_TTL_S]:
+        del _cache[k]
+    _cache.pop(key, None)
+    if len(alerts) > CACHE_MAX_ALERTS:
+        return
+    held = sum(len(entry[1]) for entry in _cache.values())
+    while _cache and (len(_cache) >= CACHE_SIZE or held + len(alerts) > CACHE_MAX_ALERTS):
+        held -= len(_cache.pop(next(iter(_cache)))[1])
+    _cache[key] = (now, alerts, complete)
+
+
+class _Flight:
+    """A window being fetched right now; callers asking for the same one wait for it."""
+
+    def __init__(self):
+        self.done = anyio.Event()
+        self.result: tuple[list, bool] | None = None
+        self.error: BabamulError | None = None
+
+
+async def _fetch(bm, survey: str, params: dict, start_jd, end_jd, budget: int) -> tuple[list, bool]:
+    """The alerts matching params in one window, page by page, up to budget, and
+    whether they are all there is."""
+    shared = _shared_cache()
+    if shared:
+        # Shared entries were fetched with someone else's token: only hand them
+        # to a token Babamul accepts.
+        await bm.check_token()
+    key = (None if shared else bm.identity, bm.base_url, survey, tuple(sorted(params.items())), start_jd, end_jd)
+    have, complete = [], False
+    while True:
+        if (hit := _cache.get(key)) and time.monotonic() - hit[0] < CACHE_TTL_S and len(hit[1]) >= len(have):
+            have, complete = hit[1], hit[2]
+        if complete or len(have) >= budget:
+            return have[:budget], complete and len(have) <= budget
+        if (flight := _inflight.get(key)) is None:
             break
-    return alerts
+        # Someone is fetching this window right now: wait for theirs rather than
+        # ask Babamul twice. If it was cut short or stopped, look again.
+        await flight.done.wait()
+        if flight.error is not None:
+            raise BabamulError(str(flight.error))
+        if flight.result is not None and len(flight.result[0]) >= len(have):
+            have, complete = flight.result
+
+    flight = _inflight[key] = _Flight()
+    try:
+        # BOOM returns alerts sorted by _id, so pages carry on from what is already here.
+        alerts, complete = list(have), False
+        while len(alerts) < budget:
+            page_size = min(PAGE_SIZE, budget - len(alerts))
+            page = await bm.get(
+                f"/surveys/{survey}/alerts",
+                **params,
+                start_jd=start_jd,
+                end_jd=end_jd,
+                limit=page_size,
+                skip=len(alerts),
+            )
+            alerts.extend(_slim(a) for a in page)
+            if len(page) < page_size:
+                complete = True
+                break
+        if start_jd is not None and end_jd is not None and end_jd < s.now_jd():
+            _store(key, alerts, complete)
+        flight.result = (alerts, complete)
+        return alerts, complete
+    except BabamulError as e:
+        flight.error = e
+        raise
+    finally:
+        del _inflight[key]
+        flight.done.set()
 
 
 @tool()
@@ -94,9 +191,12 @@ async def convert_time(
     "last night" or "this week" means for a query.
     """
     try:
-        return s.describe_time(s.to_jd(value if value is not None else "now"))
-    except ValueError as e:
+        out = s.describe_time(s.to_jd(value if value is not None else "now"))
+    except (ValueError, OverflowError, OSError) as e:
         raise ToolError(str(e)) from e
+    if value is None or value.strip().lower() == "now":
+        out["nights"] = {survey: s.night_windows(survey) for survey in s.NIGHTS_UTC}
+    return out
 
 
 @tool()
@@ -158,7 +258,7 @@ async def search_alerts(
     try:
         start_jd = s.to_jd(start) if start is not None else None
         end_jd = s.to_jd(end) if end is not None else None
-    except ValueError as e:
+    except (ValueError, OverflowError, OSError) as e:
         raise ToolError(str(e)) from e
     if start_jd is not None and end_jd is None:
         end_jd = min(start_jd + 1.0, s.now_jd())
@@ -187,32 +287,42 @@ async def search_alerts(
         if start_jd is None:
             raise ToolError("Give a time window (start/end), a cone (ra, dec, radius_arcsec), or an object_id.")
         hours = _hours(start_jd, end_jd)
-        alerts, seen = [], set()
+        alerts, seen, i = [], set(), 0
         # Hour by hour in time order, a few at a time, until the budget runs out.
-        for i in range(0, len(hours), CONCURRENCY):
-            batch = hours[i : i + CONCURRENCY]
+        while i < len(hours) and len(alerts) < max_scanned and not truncated:
+            left = max_scanned - len(alerts)
+            # Each hour of a batch may fetch all that is left of the budget, so
+            # with less than a page left, one hour at a time wastes less.
+            batch = hours[i : i + (CONCURRENCY if left >= PAGE_SIZE else 1)]
+            i += len(batch)
             results = [None] * len(batch)
 
-            async def run(j, window):
-                results[j] = await _fetch(bm, survey, params, *window, budget=max_scanned)
+            async def run(j, window, budget):
+                results[j] = await _fetch(bm, survey, params, *window, budget=budget)
 
-            async with anyio.create_task_group() as tg:
-                for j, window in enumerate(batch):
-                    tg.start_soon(run, j, window)
-            for chunk in results:
+            try:
+                async with anyio.create_task_group() as tg:
+                    for j, window in enumerate(batch):
+                        tg.start_soon(run, j, window, left)
+            except* ToolError as group:
+                # Unwrapped, or the model gets "Error executing tool" instead of what to change.
+                raise group.exceptions[0] from None
+            for chunk, complete in results:
+                # A chunk cut short by the budget leaves alerts unseen, even when
+                # few of the ones fetched fall inside the window.
+                truncated = truncated or not complete
                 # BOOM's jd bounds are inclusive at both ends, so an alert on an hour
                 # boundary comes back in both neighboring chunks.
                 for a in chunk:
                     if start_jd <= (a.get("candidate") or {}).get("jd", 0) <= end_jd and a["candid"] not in seen:
                         seen.add(a["candid"])
                         alerts.append(a)
-            if len(alerts) >= max_scanned or any(len(r) >= max_scanned for r in results):
-                truncated = i + CONCURRENCY < len(hours) or len(alerts) >= max_scanned
-                alerts = alerts[:max_scanned]
-                break
+        # Hours never fetched once the budget ran out may hold more.
+        truncated = truncated or i < len(hours) or len(alerts) > max_scanned
+        alerts = alerts[:max_scanned]
     else:
-        alerts = await _fetch(bm, survey, params, start_jd, end_jd, budget=max_scanned)
-        truncated = len(alerts) >= max_scanned
+        alerts, complete = await _fetch(bm, survey, params, start_jd, end_jd, budget=max_scanned)
+        truncated = not complete
     scanned = len(alerts)
 
     def keep(a):
@@ -263,14 +373,20 @@ async def search_alerts(
     }
     if truncated:
         result["note"] = (
-            f"Stopped after {scanned} alerts (max_scanned). matched and objects are lower "
-            "bounds; add cuts or narrow the window for complete counts."
+            f"Part of this search reached max_scanned ({max_scanned}) before BOOM ran out of "
+            "alerts, so some were never scanned. matched and objects are lower bounds; add cuts "
+            "or narrow the window for complete counts."
         )
     return {k: v for k, v in result.items() if v is not None}
 
 
 async def _object(ctx: Context, survey: str, object_id: str) -> dict:
-    return await babamul(ctx).get(f"/surveys/{survey}/objects/{object_id.strip()}")
+    return await babamul(ctx).get(f"/surveys/{survey}/objects/{checked_object_id(object_id)}")
+
+
+async def _render(fn, *args) -> bytes:
+    """fn(*args) in a worker thread, so a plot does not stall every other stream."""
+    return await anyio.to_thread.run_sync(fn, *args, limiter=_render_limiter)
 
 
 @tool()
@@ -316,7 +432,7 @@ async def get_light_curve(
     }
     content = [header, s.rows_as_csv(shown)]
     if plot:
-        content.append(Image(data=plots.light_curve(rows, f"{survey} {object_id}"), format="png"))
+        content.append(Image(data=await _render(plots.light_curve, rows, f"{survey} {object_id}"), format="png"))
     return content
 
 
@@ -335,13 +451,17 @@ async def get_cutouts(
     if candid is None:
         if object_id is None:
             raise ToolError("Give object_id or candid.")
-        candid = str((await _object(ctx, survey, object_id)).get("candid"))
+        candid = (await _object(ctx, survey, object_id)).get("candid")
+        if candid is None:
+            raise ToolError(f"{object_id} has no alert to show cutouts of.")
+        candid = str(candid)
     data = await bm.get(f"/surveys/{survey}/cutouts", candid=candid)
     images = [base64.b64decode(data.get(k) or "") for k in ("cutoutScience", "cutoutTemplate", "cutoutDifference")]
     if not any(images):
         raise ToolError(f"No cutouts stored for candid {candid}.")
     title = f"{survey} {object_id or ''} candid {candid}".replace("  ", " ")
-    return [f"Cutouts of {title}", Image(data=plots.cutout_triplet(*images, title, flip=survey == "ZTF"), format="png")]
+    png = await _render(lambda: plots.cutout_triplet(*images, title, flip=survey == "ZTF"))
+    return [f"Cutouts of {title}", Image(data=png, format="png")]
 
 
 @tool()
@@ -358,7 +478,7 @@ async def get_cross_matches(
     Gaia DR3, VSX, Milliquas, DESI, PS1, Legacy Survey, WISE, 2MASS, GALEX, X-ray catalogs),
     nearest first.
     """
-    data = await babamul(ctx).get(f"/surveys/{survey}/objects/{object_id.strip()}/cross-matches")
+    data = await babamul(ctx).get(f"/surveys/{survey}/objects/{checked_object_id(object_id)}/cross-matches")
     if catalogs:
         wanted = {c.lower() for c in catalogs}
         data = {k: v for k, v in data.items() if k.lower() in wanted}

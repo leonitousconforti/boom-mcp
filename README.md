@@ -36,15 +36,32 @@ boom-mcp                        # stdio, for a local client
 boom-mcp --http --port 8000     # Streamable HTTP at /mcp; each caller sends their own token
 ```
 
-Behind a reverse proxy, bind publicly and name the hosts it is reached by (other `Host`
-headers get a 421); `GET /healthz` is there for the proxy:
+`--host` is the address to listen on. The default, `127.0.0.1`, takes connections from this
+machine only: a reverse proxy or SSH tunnel on it. `GET /healthz` is there for the proxy.
+
+`/mcp` checks the `Host` header of each request against the names in `--allowed-host`
+(repeatable), plus `localhost:PORT` and `127.0.0.1:PORT`; any other gets a 421. Name every
+public name a proxy or tunnel passes on to `/mcp`:
 
 ```bash
-boom-mcp --http --host 0.0.0.0 --port 8765 --allowed-host boom-mcp.example.org
+boom-mcp --http --port 8765 --allowed-host babamul.umn.edu --allowed-host boom-mcp.example.org
 ```
 
+Without `--allowed-host` the server warns at startup. With `--host 127.0.0.1` it warns that a
+proxy passing on a public name gets a 421 on `/mcp`; that is the usual cause of a 421 behind a
+proxy. With a public `--host` it warns that `/mcp` then accepts any `Host` header: do not fix a 421
+that way. The check is only on `/mcp`: the assistant's routes and `/healthz` answer whatever the
+`Host`.
+
 A web page on another origin can call the server from a browser only if you name that origin
-with `--cors-origin https://chat.example.org` (repeatable). Pages on localhost are always allowed.
+with `--cors-origin https://chat.example.org` (repeatable). Pages on localhost are always allowed,
+and so are pages served from an `--allowed-host` name itself.
+
+A restart waits at most 10 seconds for open answers, then cuts them off; the web app tells those
+people their answer was cut off. Nothing restarts the server after a crash, so on a shared node
+run it under a loop in tmux, for example
+`while true; do boom-mcp --http ... >> boom-mcp.log 2>&1; sleep 2; done`, and keep to one process:
+the limits and caches live in it.
 
 To work on it, `nix develop` gives a shell with `uv` and Node (for the MCP Inspector) and syncs
 the environment.
@@ -77,12 +94,14 @@ A chat panel for the Babamul web app. The browser sends the conversation and the
 Babamul token to this server. The server asks a language model, runs the tools the model picks
 with that person's token, and streams the answer back. The model's API key stays on the server.
 
-Turn it on with `--assistant` and point it at an OpenAI-compatible model:
+Turn it on with `--assistant` and point it at an OpenAI-compatible model. When the model runs
+on the same machine, use its own address (such as `http://127.0.0.1:8081/v1`) rather than a
+public URL, so no proxy sits between the two:
 
 ```bash
-export ASSISTANT_LLM_URL=https://babamul.umn.edu/llm/qwen3-27b/v1
-export ASSISTANT_LLM_MODEL=qwen3-27b
-export ASSISTANT_LLM_API_KEY=...
+export ASSISTANT_LLM_URL=http://127.0.0.1:8081/v1
+export ASSISTANT_LLM_MODEL=ggml-org/Qwen3.8-27B-GGUF:Q8_0
+export ASSISTANT_LLM_API_KEY=   # empty for a local llama.cpp without --api-key
 boom-mcp --http --assistant
 ```
 
@@ -93,12 +112,22 @@ This adds two routes next to `/mcp`, under `/assistant` (change it with `--assis
 - `POST /assistant/chat` takes `{"messages": [...], "context": {...}}` and an
   `Authorization: Bearer <Babamul token>` header. It answers with server-sent events, one
   `data: {...}` line each: `status`, `text`, `tool_call`, `tool_result` (with any images),
-  `done` and `error`.
+  `done` and `error`. A body over 1 MB gets a 413.
 
 The token is checked with Babamul's `GET /profile` before the model is asked, and the result is
-kept for 5 minutes. A missing or rejected token gets a 401. Each person can have one question
-running, and ask 20 questions per 10 minutes; past that they get a 429. At most 4 questions use
-the model at once. The others wait their turn and see "Waiting for the model".
+kept for 5 minutes. A missing or rejected token gets a 401, and so does one not shaped like a
+Bearer token, without asking Babamul. Each person can have one question running, and ask 20
+questions per 10 minutes; past that they get a 429.
+
+`ASSISTANT_CONCURRENCY` questions are answered at once, 2 by default. Set it to the number of
+slots the model server has (llama.cpp's `-np`), for example 8 on a dedicated instance. More would
+wait inside the model server, where nobody can see how long. A question keeps its place on the
+model until it is answered, tool calls included, so a slot sits idle while a tool runs; in
+exchange every question let in can finish, and the model keeps its prompt cached. The others wait
+in line, first come first served, and see their place in it ("Waiting for the model, 3 questions
+ahead of you"). A question's answer timeout starts when it leaves the line. Waiting gives up after
+`ASSISTANT_QUEUE_TIMEOUT`; when `ASSISTANT_MAX_QUEUE` questions are already waiting, a new one
+gets a 429 at once.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
@@ -110,18 +139,22 @@ the model at once. The others wait their turn and see "Waiting for the model".
 | `ASSISTANT_LLM_VISION` | `false` | Also show the model the images the tools return |
 | `ASSISTANT_THINKING` | `false` | Let a reasoning model think before it answers |
 | `ASSISTANT_MAX_TOOL_CALLS` | `10` | Tool calls per question before it must answer |
-| `ASSISTANT_ANSWER_TIMEOUT` | `240` | Seconds per question. Tools stop at three quarters of it, the rest is for the answer |
-| `ASSISTANT_STALL_TIMEOUT` | `60` | Seconds the model may stay silent |
+| `ASSISTANT_ANSWER_TIMEOUT` | `240` | Seconds per question, from when it leaves the line. Tools stop at three quarters of it, the rest is for the answer. An answer already being written may use the rest too |
+| `ASSISTANT_STALL_TIMEOUT` | `60` | Seconds the model may stay silent once its reply has started. The wait for its first word only has the answer timeout |
+| `ASSISTANT_MAX_TOKENS` | `1024` | Longest reply, in tokens, so a reply that repeats itself ends. Thinking counts too, so raise it with `ASSISTANT_THINKING`. `0` for no limit |
 | `ASSISTANT_RESULT_BUDGET` | `20000` | Characters of one tool result the model reads |
 | `ASSISTANT_CONTEXT_BUDGET` | `60000` | Characters of conversation before old tool results are cut down |
 | `ASSISTANT_MAX_MESSAGES` | `30` | Past messages sent to the model |
-| `ASSISTANT_CONCURRENCY` | `4` | Model calls at once, for everyone together |
+| `ASSISTANT_CONCURRENCY` | `2` | Questions answered at once, for everyone together. Match the model server's slots |
+| `ASSISTANT_QUEUE_TIMEOUT` | `300` | Seconds a question may wait in line before it gives up |
+| `ASSISTANT_MAX_QUEUE` | `20` | Questions that may wait in line. Past it a new question gets a 429 |
 | `ASSISTANT_RATE_LIMIT` | `20` | Questions per person per window |
 | `ASSISTANT_RATE_WINDOW` | `600` | The window, in seconds |
 | `ASSISTANT_FALLBACK_URL` | none | A second model, tried when the first is down, busy or failing. It is then used first for 5 minutes |
 | `ASSISTANT_FALLBACK_MODEL` | empty | Its model name |
 | `ASSISTANT_FALLBACK_API_KEY` | empty | Its key |
 | `BABAMUL_API_URL` | production | The Babamul API for the tools and the token check |
+| `BOOM_MCP_SHARED_ALERT_CACHE` | unset | `1` shares search_alerts' hour cache between users (Babamul's alert search does not depend on the user today); unset keys it by user |
 
 ### With Docker
 
@@ -170,7 +203,7 @@ location /api/assistant/ {
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_buffering off;      # pass each event on as it comes
-    proxy_read_timeout 300s;  # longer than ASSISTANT_ANSWER_TIMEOUT
+    proxy_read_timeout 300s;  # longer than the 15 s between events
 }
 ```
 

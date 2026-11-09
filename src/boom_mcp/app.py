@@ -22,7 +22,8 @@ Before you trust a result:
 - Times. Alerts are indexed by Julian Date. Use convert_time instead of doing \
 date arithmetic yourself, and call it with no argument to learn the current \
 time. "Last night" for ZTF (Palomar, UTC-8) is roughly 02:00-14:00 UTC; for \
-Rubin (Chile, UTC-3) roughly 23:00-10:00 UTC.
+Rubin (Chile, UTC-3) roughly 23:00-10:00 UTC. convert_time with no argument gives the exact \
+dates of the last night.
 - Magnitudes. Smaller is brighter. A source that is brightening has a \
 decreasing magnitude. Limits are 3-sigma upper limits: the source was fainter \
 than that, not that bright.

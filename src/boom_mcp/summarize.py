@@ -6,10 +6,14 @@ the object would look at, and are pure so they can be tested without network.
 """
 
 import math
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 
 JD_UNIX_EPOCH = 2440587.5
 MJD_OFFSET = 2400000.5
+# JDs this server takes, years 1585 to 2406; a bigger number is more likely unix
+# seconds or a compact date such as 20261106.
+JD_RANGE = (2_300_000, 2_600_000)
 # The flux zero points the babamul package uses (fluxes are in units of 1e-9 of these).
 FLUX_ZP = {"ZTF": 23.9, "LSST": 8.9}
 ZTF_FID_BAND = {1: "g", 2: "r", 3: "i"}
@@ -31,26 +35,63 @@ def to_jd(value) -> float:
         text = value.strip()
         if text.lower() == "now":
             return now_jd()
+        # Models write "MJD 61353.30" or "JD 2461353.8"; the prefix settles which.
+        if m := re.fullmatch(r"(?i)(m?jd)\s*[:=]?\s*([0-9]+(?:\.[0-9]*)?)", text):
+            jd = float(m.group(2)) + (MJD_OFFSET if m.group(1).lower() == "mjd" else 0)
+            if not JD_RANGE[0] <= jd <= JD_RANGE[1]:
+                raise ValueError(f"{value} is out of range for a {m.group(1).upper()}.")
+            return jd
         try:
-            value = float(text)
+            number = float(text)
         except ValueError:
             dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=UTC)
             return dt.timestamp() / 86400 + JD_UNIX_EPOCH
-    value = float(value)
-    if value > 2_000_000:
-        return value
-    if 30_000 < value < 100_000:
-        return value + MJD_OFFSET
-    raise ValueError(f"{value} is neither a JD (~2.46e6) nor an MJD (~6e4)")
+    else:
+        number = float(value)
+    if JD_RANGE[0] <= number <= JD_RANGE[1]:
+        return number
+    if 30_000 < number < 100_000:
+        return number + MJD_OFFSET
+    raise ValueError(
+        f"{value} is neither a JD (~2.46e6) nor an MJD (~6e4). Give one of those or an ISO "
+        "date/time (UTC); unix seconds and compact dates such as 20261106 are not accepted."
+    )
 
 
 def jd_to_iso(jd: float | None) -> str | None:
     if jd is None:
         return None
-    dt = datetime.fromtimestamp((jd - JD_UNIX_EPOCH) * 86400, UTC)
+    # Rounded, not truncated: a JD float is off by ~1e-5 s, so a whole second
+    # would print one second early about half the time.
+    dt = datetime.fromtimestamp(round((jd - JD_UNIX_EPOCH) * 86400), UTC)
     return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# Observing nights in UTC hours: ZTF at Palomar (UTC-8), Rubin in Chile (UTC-3).
+NIGHTS_UTC = {"ZTF": (2, 14), "LSST": (23, 10)}
+
+
+def night_windows(survey: str, now: datetime | None = None) -> dict:
+    """The survey's last finished night and, if one is under way, tonight so far.
+
+    "Last night" means the most recent night that has ended. Models picking the
+    date themselves from a clock range got it a day off, so the dates are worked
+    out here.
+    """
+    now = now or datetime.now(UTC)
+    start_h, end_h = NIGHTS_UTC[survey]
+    length = timedelta(hours=(end_h - start_h) % 24)
+    end = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+    if end > now:
+        end -= timedelta(days=1)
+    iso = lambda dt: dt.isoformat(timespec="minutes").replace("+00:00", "Z")
+    out = {"last_night": {"start": iso(end - length), "end": iso(end)}}
+    tonight = end + timedelta(days=1) - length
+    if tonight <= now:
+        out["tonight_so_far"] = {"start": iso(tonight), "end": iso(now)}
+    return out
 
 
 def describe_time(jd: float) -> dict:
@@ -394,8 +435,11 @@ def object_summary(obj: dict, survey: str) -> dict:
     out["latest_alert"].pop("ml", None)
     out["latest_alert"].pop("host", None)
     out["latest_alert"].pop("flags", None)
+    # An alert AppleCiDEr never ran on (too few points) is not an abstention.
     history = [
         ((h.get("applecider_fusion") or {}).get("decision_label") or "abstained")
+        if h.get("applecider_fusion")
+        else "no AppleCiDEr result"
         for h in obj.get("classifications_history") or []
     ]
     if history:
