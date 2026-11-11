@@ -10,10 +10,11 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from .babamul import Babamul, base_url_from_env
+from .surveys import SURVEY_NOTES
 
 # Conventions a model cannot infer from the tool schemas, and that silently give
 # a wrong answer when missed. Same idea as SkyPortal's /mcp instructions.
-INSTRUCTIONS = """Query BOOM, the alert broker for ZTF and Rubin/LSST, through its \
+CONVENTIONS = """Query BOOM, the alert broker for ZTF and Rubin/LSST, through its \
 public Babamul API: alerts, light curves, image cutouts, catalog cross-matches, \
 and the machine-learning outputs BOOM computes for every public ZTF alert.
 
@@ -25,10 +26,12 @@ time. "Last night" for ZTF (Palomar, UTC-8) is roughly 02:00-14:00 UTC; for \
 Rubin (Chile, UTC-3) roughly 23:00-10:00 UTC. convert_time with no argument gives the exact \
 dates of the last night.
 - Magnitudes. Smaller is brighter. A source that is brightening has a \
-decreasing magnitude. Limits are 3-sigma upper limits: the source was fainter \
-than that, not that bright.
-- Reliability (ZTF drb, LSST reliability) is a 0-1 real/bogus score. ZTF \
-alerts below ~0.5 are mostly artifacts.
+decreasing magnitude. Alert magnitudes are measured on the difference image, \
+so they give the change since the reference image: the total brightness only \
+where nothing was there before. negative: true (a negative mag in a \
+light-curve CSV) means fainter than in the reference. Limits are 5-sigma \
+upper limits: the source was fainter than that, not that bright.
+- Reliability (ZTF drb, LSST reliability) is a 0-1 real/bogus score.
 - Babamul serves public data only (ZTF programid 1, public Rubin alerts), so \
 "not found" can mean "not public".
 - Volume. One hour of public ZTF is ~20,000 alerts. A time-only \
@@ -38,19 +41,12 @@ max_scanned long before the night is done. Cut first, then widen.
 - Counts. Only report a number of alerts or objects that a tool returned \
 (matched, objects). When a result says truncated, that number is a lower bound \
 and you must say so. Never estimate a count you did not measure.
-- Machine learning (ZTF only). ACAI scores (hosted, nuclear, variable_star, \
-orphan, bogus) are independent 0-1 scores, not a distribution. BTSbot is the \
-probability that a bright (<18.5 mag) transient is a supernova worth Bright \
-Transient Survey follow-up. AppleCiDEr is hierarchical (domain, family, class) \
-and abstains when unsure: an abstention or a family-level decision is \
-information, not a missing value. Its out_of_distribution flag marks alerts \
-unlike its training set, which is how BOOM flags anomalies. Many flagged \
-alerts are known asteroids (flags.rock), so pass exclude_solar_system=true \
-when looking for anomalous transients.
 - Candidate ids (candid) are 19-digit integers. Pass and quote them as \
 strings: as JSON numbers they lose their last digits.
 - An empty result is more often a too-tight cut or the wrong survey than an \
 empty sky. Loosen one cut at a time before concluding nothing is there."""
+
+INSTRUCTIONS = "\n\n".join([CONVENTIONS, *SURVEY_NOTES.values()])
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
