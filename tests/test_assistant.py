@@ -524,7 +524,7 @@ async def test_health_and_routes_only_when_enabled(make):
     args.assistant_prefix = "/api/assistant/"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(http_app(args)), base_url="http://boom") as client:
         response = await client.get("/api/assistant/health")
-    assert response.json() == {"status": "ok", "model": "qwen", "vision": True}
+    assert response.json() == {"status": "ok", "model": "qwen", "vision": True, "own_keys": None}
 
 
 # A raw ASGI request, to control when the client leaves, the way uvicorn reports it.

@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 import uuid
 from collections import deque
@@ -31,12 +32,14 @@ import httpx
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from . import providers as p
 from . import summarize as s
 from .app import INSTRUCTIONS, caller, mcp, settings
 from .babamul import USER_AGENT, Babamul, base_url_from_env
+from .keystore import SHARED, KeyStore
 
 log = logging.getLogger("boom_mcp.assistant")
 
@@ -98,6 +101,10 @@ TOKEN_CACHE = 4096
 # A Bearer token as RFC 6750 spells it. Babamul's API and login tokens both fit; anything
 # else Babamul would refuse, and a byte outside ASCII would crash the request to it.
 TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}=*")
+# A login token of the Babamul web app, a JWT, as opposed to a bbml_ API token. Only
+# these may manage or spend a person's own model key: API tokens end up in notebooks
+# and repositories, and Babamul never expires them.
+LOGIN_TOKEN = re.compile(r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 # A model API key: printable ASCII with no spaces. Anything else in an Authorization
 # header makes h11 raise an error that quotes the whole header, key and all, and
 # that error would reach the logs.
@@ -111,10 +118,33 @@ OWN_HEADERS = frozenset({"accept", "authorization", "content-length", "content-t
 KINDS = ("llamacpp", "openai")
 MAX_BODY = 1_000_000
 MAX_MESSAGE_CHARS = 20_000
+# How long a person may have their key kept, in days, and the usual choice.
+KEY_DAYS = (1, 7, 30, 90)
+DEFAULT_KEY_DAYS = 30
+# Keys a person may save in an hour, each checked with the provider, so that this
+# server cannot be used to try out keys found elsewhere.
+SAVES_PER_HOUR = 10
+# Seconds between sweeps of expired keys.
+SWEEP_EVERY = 3600.0
+MAX_KEY_BODY = 16_000
 
 
 def env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_number(env, name, default):
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return type(default)(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, not {raw!r}") from None
+
+
+def is_login(token: str) -> bool:
+    return not token.startswith("bbml_") and bool(LOGIN_TOKEN.fullmatch(token))
 
 
 def check_key(key: str, what: str) -> str:
@@ -179,6 +209,8 @@ class Config:
     rate_limit: int = 20
     rate_window: float = 600.0
     fallback_period: float = 300.0
+    # People's own keys, when the operator has set up a store for them.
+    own_keys: "OwnKeys | None" = None
 
     @classmethod
     def from_env(cls, env=None) -> "Config | None":
@@ -189,13 +221,7 @@ class Config:
             return None
 
         def number(name, default):
-            raw = env.get(name, "").strip()
-            if not raw:
-                return default
-            try:
-                return type(default)(raw)
-            except ValueError:
-                raise ValueError(f"{name} must be a number, not {raw!r}") from None
+            return env_number(env, name, default)
 
         def text(name):
             # A trailing newline from an env file would otherwise reach the model's
@@ -226,7 +252,66 @@ class Config:
             max_queue=number("ASSISTANT_MAX_QUEUE", cls.max_queue),
             rate_limit=number("ASSISTANT_RATE_LIMIT", cls.rate_limit),
             rate_window=number("ASSISTANT_RATE_WINDOW", cls.rate_window),
+            own_keys=OwnKeys.from_env(env),
         )
+
+
+@dataclass
+class OwnKeys:
+    """People's own model keys: where they are kept, which providers take them, and
+    the limits on the questions they answer.
+
+    Those questions have a line and a rate limit of their own. They do not wait
+    for the operator's model, whose slots are few, and the provider and the
+    person's spending limit their pace; these limits keep this server and
+    Babamul, where their tools run, from being swamped all the same.
+    """
+
+    store: KeyStore
+    providers: dict[str, p.Provider]
+    max_days: int = 90
+    concurrency: int = 8
+    max_queue: int = 16
+    rate_limit: int = 40
+    rate_window: float = 600.0
+    max_tokens: int = 8192
+    max_images: int = 6
+
+    @classmethod
+    def from_env(cls, env) -> "OwnKeys | None":
+        """The settings in ASSISTANT_KEYS_* and ASSISTANT_BYOK_*, or None when no store is set up."""
+        store = KeyStore.from_env(env)
+        if store is None:
+            return None
+        own = cls(
+            store=store,
+            providers=p.from_env(env),
+            max_days=env_number(env, "ASSISTANT_KEYS_MAX_DAYS", cls.max_days),
+            concurrency=env_number(env, "ASSISTANT_BYOK_CONCURRENCY", cls.concurrency),
+            max_queue=env_number(env, "ASSISTANT_BYOK_MAX_QUEUE", cls.max_queue),
+            rate_limit=env_number(env, "ASSISTANT_BYOK_RATE_LIMIT", cls.rate_limit),
+            rate_window=env_number(env, "ASSISTANT_BYOK_RATE_WINDOW", cls.rate_window),
+            max_tokens=env_number(env, "ASSISTANT_BYOK_MAX_TOKENS", cls.max_tokens),
+            max_images=env_number(env, "ASSISTANT_BYOK_MAX_IMAGES", cls.max_images),
+        )
+        if own.max_days < KEY_DAYS[0]:
+            raise ValueError(f"ASSISTANT_KEYS_MAX_DAYS must be at least {KEY_DAYS[0]}")
+        return own
+
+    @property
+    def days(self) -> list[int]:
+        return [d for d in KEY_DAYS if d <= self.max_days]
+
+    @property
+    def default_days(self) -> int:
+        return DEFAULT_KEY_DAYS if DEFAULT_KEY_DAYS in self.days else self.days[-1]
+
+    def public(self) -> dict:
+        return {
+            "providers": [provider.public() for provider in self.providers.values()],
+            "days": self.days,
+            "default_days": self.default_days,
+        }
 
 
 @dataclass(frozen=True)
@@ -690,9 +775,22 @@ class BabamulDown(Exception):
 
 
 class BadRequest(Exception):
-    def __init__(self, message: str, status: int = 400):
+    """A request refused before anyone is asked. code tells the web app what to offer."""
+
+    def __init__(self, message: str, status: int = 400, code: str = "", headers: dict | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.headers = headers
+
+
+@dataclass(frozen=True)
+class Who:
+    """Who asks: person is what their limits are kept by, account their Babamul
+    user id. Only an account, never a token's stand-in, may hold keys."""
+
+    person: str
+    account: str | None
 
 
 @dataclass
@@ -874,51 +972,68 @@ class Assistant:
         self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
         self.line = Line(config.concurrency, config.max_queue)
         self.limiter = RateLimiter(config.rate_limit, config.rate_window)
+        self.own = config.own_keys
+        self.saves = RateLimiter(SAVES_PER_HOUR, 3600.0)
         # Person -> (ticket, stop) of their running question; stop ends it.
         self.active: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         # Person -> the newest of their questions still taking over from the last.
         self.claims: dict[str, object] = {}
-        # sha256 of a token -> (expiry, person or None when Babamul refused it).
-        self.tokens: dict[str, tuple[float, str | None]] = {}
+        # sha256 of a token -> (expiry, who or None when Babamul refused it).
+        self.tokens: dict[str, tuple[float, Who | None]] = {}
         self._main_skipped_until = 0.0
         self._tools: list[dict] | None = None
 
     @asynccontextmanager
     async def running(self):
-        """Holds the HTTP client for the model and Babamul while the app runs."""
-        if self.http is not None:
-            yield
-            return
-        async with settings["http_client"]() as http:
-            self.http = http
-            try:
+        """Holds the HTTP client for the model and Babamul while the app runs, and
+        sweeps out expired keys."""
+        sweeper = asyncio.create_task(self.sweep_keys()) if self.own else None
+        try:
+            if self.http is not None:
                 yield
-            finally:
-                self.http = None
+            else:
+                async with settings["http_client"]() as http:
+                    self.http = http
+                    try:
+                        yield
+                    finally:
+                        self.http = None
+        finally:
+            if sweeper is not None:
+                sweeper.cancel()
+                await asyncio.gather(sweeper, return_exceptions=True)
+
+    async def sweep_keys(self):
+        """Forget expired keys now and then. Reading a person's keys forgets theirs too,
+        but someone who never comes back would keep theirs."""
+        while True:
+            try:
+                if gone := await asyncio.to_thread(self.own.store.sweep):
+                    log.info("forgot %d expired model key%s", gone, "s" * (gone > 1))
+            except sqlite3.Error as exc:
+                log.error("could not sweep expired model keys: %s", type(exc).__name__)
+            await asyncio.sleep(SWEEP_EVERY)
 
     # Routes.
 
     async def health(self, request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "model": self.config.llm.model, "vision": self.config.vision})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "model": self.config.llm.model,
+                "vision": self.config.vision,
+                "own_keys": self.own.public() if self.own else None,
+            }
+        )
 
     async def chat(self, request: Request):
-        auth = request.headers.get("authorization", "")
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        if not token:
-            return error(401, "Log in to Babamul to use the assistant.")
-        if not TOKEN.fullmatch(token):
-            # Babamul would refuse it, so it is not asked.
-            return error(401, "Babamul did not accept your login. Log in again.")
         try:
+            token = bearer(request)
             messages, context = parse_body(await read_body(request))
+            who = await self.identify(token)
         except BadRequest as exc:
-            return error(exc.status, str(exc))
-        try:
-            person = await self.person(token)
-        except BabamulDown:
-            return error(503, "Could not reach Babamul to check your login. Try again in a minute.")
-        if person is None:
-            return error(401, "Babamul did not accept your login. Log in again.")
+            return error(exc.status, str(exc), headers=exc.headers, code=exc.code)
+        person = who.person
         model, line, limiter = self.shared_model(), self.line, self.limiter
 
         if (wait := limiter.retry_after(person)) > 0:
@@ -1027,14 +1142,30 @@ class Assistant:
     # Who is asking.
 
     async def person(self, token: str) -> str | None:
-        """The Babamul user id the token belongs to, or None when Babamul refuses it.
+        """The id a person's limits are kept by, or None when Babamul refuses the token."""
+        who = await self.who(token)
+        return who.person if who else None
+
+    async def identify(self, token: str, fresh: bool = False) -> "Who":
+        """Who the token belongs to, or BadRequest with the status to answer."""
+        try:
+            who = await self.who(token, fresh)
+        except BabamulDown:
+            raise BadRequest("Could not reach Babamul to check your login. Try again in a minute.", 503) from None
+        if who is None:
+            raise BadRequest("Babamul did not accept your login. Log in again.", 401)
+        return who
+
+    async def who(self, token: str, fresh: bool = False) -> "Who | None":
+        """Who the token belongs to, or None when Babamul refuses it.
 
         GET /profile is the cheapest call Babamul authenticates, and the id lets
-        one person's login and API tokens share their limits.
+        one person's login and API tokens share their limits. Answers are kept
+        for a while; fresh asks again, for changes to a person's keys.
         """
         key = hashlib.sha256(token.encode()).hexdigest()
         now = time.monotonic()
-        if (hit := self.tokens.get(key)) and hit[0] > now:
+        if not fresh and (hit := self.tokens.get(key)) and hit[0] > now:
             return hit[1]
         try:
             response = await self.http.get(
@@ -1055,7 +1186,10 @@ class Assistant:
             except ValueError as exc:
                 raise BabamulDown("profile is not JSON") from exc
             data = body.get("data", body) if isinstance(body, dict) else {}
-            person, ttl = str((data or {}).get("id") or key), TOKEN_TTL
+            account = (data or {}).get("id") if isinstance(data, dict) else None
+            account = str(account) if account else None
+            # Without an id, limits are kept by the token; its keys, if any, are not reachable.
+            person, ttl = Who(account or key, account), TOKEN_TTL
         if len(self.tokens) >= TOKEN_CACHE:
             self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
             if len(self.tokens) >= TOKEN_CACHE:
@@ -1072,6 +1206,146 @@ class Assistant:
         while self.claims.get(person) is claim and (entry := self.active.pop(person, None)) is not None:
             log.info("user %s asked again, so their running question stops", person)
             await entry[1]()
+
+    # People's own keys. Write-only: no route answers with a key, or anything sealed
+    # from one. Only the web app's login tokens may use them, and a change asks
+    # Babamul afresh who the token belongs to.
+
+    async def keys_route(self, request: Request, handle, fresh: bool = True) -> Response:
+        """Run handle(request, account) for a person logged in to the web app."""
+        if self.own is None:
+            return error(404, "Personal model keys are not turned on here.", code="not_found")
+        try:
+            token = bearer(request)
+            if not is_login(token):
+                raise BadRequest(
+                    "Manage model keys from the Babamul web app. Babamul API tokens cannot use them.",
+                    403,
+                    "login_required",
+                )
+            who = await self.identify(token, fresh)
+            if not who.account:
+                # Never by the token's stand-in id: a new login would lose the keys, or find another's.
+                raise BadRequest(
+                    "Babamul did not say which account this is, so keys cannot be kept for it.", 403, "no_account"
+                )
+            return await handle(request, who.account)
+        except BadRequest as exc:
+            return error(exc.status, str(exc), headers=exc.headers, code=exc.code)
+        except sqlite3.Error as exc:
+            return store_down(exc)
+
+    def provider(self, name) -> p.Provider:
+        if isinstance(name, str) and (provider := self.own.providers.get(name)):
+            return provider
+        raise BadRequest("That model provider is not offered here.", 404, "not_found")
+
+    def shown_keys(self, account: str) -> dict:
+        """The person's choice and keys, as GET /keys answers. A choice of a provider no
+        longer offered counts as the shared model."""
+        store, offered = self.own.store, list(self.own.providers)
+        use = store.use(account)
+        keys = [e for e in store.entries(account) if e["provider"] in offered]
+        keys.sort(key=lambda e: offered.index(e["provider"]))
+        return {"use": use if use in offered else SHARED, "keys": keys}
+
+    async def list_keys(self, request: Request) -> Response:
+        async def handle(request, account):
+            return JSONResponse(await asyncio.to_thread(self.shown_keys, account))
+
+        return await self.keys_route(request, handle, fresh=False)
+
+    async def save_key(self, request: Request) -> Response:
+        async def handle(request, account):
+            provider = self.provider(request.path_params.get("provider"))
+            body = await key_body(request)
+            try:
+                key = provider.check_format(body.get("key"))
+            except p.BadKey as exc:
+                raise BadRequest(str(exc), 400, "bad_format") from None
+            model = self.model_named(provider, body.get("model", provider.default_model))
+            days = body.get("days", self.own.default_days)
+            if isinstance(days, bool) or not isinstance(days, int) or days not in self.own.days:
+                choices = ", ".join(map(str, self.own.days))
+                raise BadRequest(f"Keep a key for one of {choices} days.", 400, "bad_days")
+            workspace = body.get("workspace_id") if provider.workspace_field else None
+            if isinstance(workspace, str) and workspace.strip():
+                workspace = workspace.strip()
+                if not p.WORKSPACE_ID.fullmatch(workspace):
+                    raise BadRequest("A workspace id looks like wrkspc_ and letters and digits.", 400, "bad_format")
+            elif workspace is not None and workspace != "":
+                raise BadRequest("workspace_id must be text.", 400, "bad_format")
+            else:
+                workspace = None
+            use = body.get("use", True)
+            if not isinstance(use, bool):
+                raise BadRequest("use must be true or false.", 400, "bad_format")
+
+            # Counted before the provider is asked, failed checks included.
+            if (wait := self.saves.retry_after(account)) > 0:
+                minutes = math.ceil(wait / 60)
+                raise BadRequest(
+                    f"That is a lot of keys in an hour. Try again in {minutes} minute{'s' * (minutes > 1)}.",
+                    429,
+                    "too_many_saves",
+                    {"Retry-After": str(math.ceil(wait))},
+                )
+            try:
+                await provider.check_key(self.http, key, model, workspace)
+            except p.KeyRejected as exc:
+                raise BadRequest(str(exc), 422, "rejected") from None
+            except p.ProviderUnreachable as exc:
+                raise BadRequest(str(exc), 502, "provider_unreachable") from None
+            entry = await asyncio.to_thread(self.own.store.save, account, provider.id, key, model, days, workspace, use)
+            log.info("user %s saved their %s key for %d days", account, provider.name, days)
+            return JSONResponse(entry)
+
+        return await self.keys_route(request, handle)
+
+    def model_named(self, provider: p.Provider, model) -> str:
+        if model not in provider.models:
+            offered = ", ".join(provider.models)
+            raise BadRequest(f"Pick one of the {provider.name} models offered: {offered}.", 400, "bad_model")
+        return model
+
+    async def choose(self, request: Request) -> Response:
+        async def handle(request, account):
+            body = await key_body(request)
+            use = body.get("use")
+            if not isinstance(use, str):
+                raise BadRequest('use is "shared" or a provider.', 400, "bad_format")
+            if use == SHARED:
+                await asyncio.to_thread(self.own.store.set_use, account, SHARED)
+                return JSONResponse({"use": SHARED})
+            provider = self.provider(use)
+            model = body.get("model")
+            if model is not None:
+                self.model_named(provider, model)
+            entries = await asyncio.to_thread(self.own.store.entries, account)
+            if not any(e["provider"] == provider.id and e["state"] == "ok" for e in entries):
+                raise BadRequest(f"Save your {provider.name} key first.", 409, "no_key")
+            await asyncio.to_thread(self.own.store.set_use, account, provider.id, model)
+            log.info("user %s chose their %s key", account, provider.name)
+            return JSONResponse({"use": provider.id})
+
+        return await self.keys_route(request, handle)
+
+    async def delete_key(self, request: Request) -> Response:
+        async def handle(request, account):
+            provider = self.provider(request.path_params.get("provider"))
+            await asyncio.to_thread(self.own.store.delete, account, provider.id)
+            log.info("user %s removed their %s key", account, provider.name)
+            return Response(status_code=204)
+
+        return await self.keys_route(request, handle)
+
+    async def delete_keys(self, request: Request) -> Response:
+        async def handle(request, account):
+            await asyncio.to_thread(self.own.store.delete_all, account)
+            log.info("user %s removed all their keys", account)
+            return Response(status_code=204)
+
+        return await self.keys_route(request, handle)
 
     # Answering.
 
@@ -1449,18 +1723,43 @@ class Assistant:
         return message
 
 
-async def read_body(request: Request) -> bytes:
+def bearer(request: Request) -> str:
+    """The Babamul token a request carries, or BadRequest (401) without asking Babamul,
+    when there is none or Babamul would refuse it."""
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        raise BadRequest("Log in to Babamul to use the assistant.", 401)
+    if not TOKEN.fullmatch(token):
+        raise BadRequest("Babamul did not accept your login. Log in again.", 401)
+    return token
+
+
+async def read_body(request: Request, limit: int | None = None, too_long: str = "") -> bytes:
     """The request body, refused as soon as it is too long rather than once it is all in memory."""
-    too_long = BadRequest("The conversation is too long. Start a new chat.", 413)
+    limit = MAX_BODY if limit is None else limit
+    too_long = BadRequest(too_long or "The conversation is too long. Start a new chat.", 413)
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY:
+    if declared.isdigit() and int(declared) > limit:
         raise too_long
     body = bytearray()
     async for part in request.stream():
         body += part
-        if len(body) > MAX_BODY:
+        if len(body) > limit:
             raise too_long
     return bytes(body)
+
+
+async def key_body(request: Request) -> dict:
+    """The JSON object a key route was sent. Errors never quote it: it may hold a key."""
+    raw = await read_body(request, MAX_KEY_BODY, "That request is too long for a key.")
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.", 400, "bad_format")
+    return body
 
 
 def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
@@ -1493,8 +1792,16 @@ def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
     return turns, context
 
 
-def error(status: int, message: str, headers: dict | None = None) -> JSONResponse:
-    return JSONResponse({"error": message}, status_code=status, headers=headers)
+def store_down(exc: sqlite3.Error) -> JSONResponse:
+    log.error("the key store failed: %s", type(exc).__name__)
+    return error(503, "Saved keys cannot be reached right now. Try again in a minute.", code="store_unavailable")
+
+
+def error(status: int, message: str, headers: dict | None = None, code: str = "") -> JSONResponse:
+    body = {"error": message}
+    if code:
+        body["code"] = code
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def mount(app, assistant: Assistant, prefix: str = "/assistant"):
@@ -1503,6 +1810,12 @@ def mount(app, assistant: Assistant, prefix: str = "/assistant"):
     app.router.routes[0:0] = [
         Route(f"{prefix}/health", assistant.health, methods=["GET"]),
         Route(f"{prefix}/chat", assistant.chat, methods=["POST"]),
+        # GET, POST and DELETE only: the CORS settings in server.py allow no others.
+        Route(f"{prefix}/keys", assistant.list_keys, methods=["GET"]),
+        Route(f"{prefix}/keys", assistant.delete_keys, methods=["DELETE"]),
+        Route(f"{prefix}/keys/{{provider}}", assistant.save_key, methods=["POST"]),
+        Route(f"{prefix}/keys/{{provider}}", assistant.delete_key, methods=["DELETE"]),
+        Route(f"{prefix}/choice", assistant.choose, methods=["POST"]),
     ]
     inner = app.router.lifespan_context
 

@@ -4,6 +4,7 @@ import base64
 import gzip
 import io
 import json
+from types import SimpleNamespace
 
 import httpx
 import numpy as np
@@ -112,11 +113,19 @@ def fits_gz(seed, background=100.0, source=300.0):
     return base64.b64encode(gzip.compress(buf.getvalue())).decode()
 
 
+# A login token of the web app, a JWT, for the user bbml_test belongs to, and one whose profile has no id.
+LOGIN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEifQ.ZmFrZS1zaWduYXR1cmU"
+LOGIN_NO_ID = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub2JvZHkifQ.bm8taWQtc2lnbmF0dXJl"
+FAKE_ANTHROPIC_KEY = "sk-ant-api03-FAKE" + "0" * 76 + "ab12"
+FAKE_OPENROUTER_KEY = "sk-or-v1-FAKE" + "0" * 60 + "cd34"
+KEYS_SECRET = bytes(range(32))
+
+
 class FakeBabamul:
     def __init__(self):
         self.requests = []
-        # Accepted tokens, and the user each belongs to.
-        self.tokens = {"bbml_test": "user-1"}
+        # Accepted tokens, and the user each belongs to (None: a profile without an id).
+        self.tokens = {"bbml_test": "user-1", LOGIN: "user-1", LOGIN_NO_ID: None}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -164,3 +173,71 @@ def fake(monkeypatch):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+class FakeProviders:
+    """The key checks of api.anthropic.com and openrouter.ai. A key in `good` passes;
+    a refusal quotes the key back, as a provider may. `reply` is a status or an
+    exception every check gets instead."""
+
+    def __init__(self):
+        self.good = {FAKE_ANTHROPIC_KEY, FAKE_OPENROUTER_KEY}
+        self.requests = []
+        self.reply = None
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        if request.url.host == "api.anthropic.com" and request.url.path == "/v1/messages/count_tokens":
+            key = request.headers.get("x-api-key", "")
+            refused = {"type": "error", "error": {"type": "authentication_error", "message": f"invalid x-api-key: {key}"}}
+            good = {"input_tokens": 9}
+        elif request.url.host == "openrouter.ai" and request.url.path == "/api/v1/key":
+            key = request.headers.get("authorization", "").removeprefix("Bearer ")
+            refused = {"error": {"code": 401, "message": f"No auth credentials found for {key}"}}
+            good = {"data": {"limit": 5, "limit_remaining": 4.2, "usage": 0.8}}
+        else:
+            return httpx.Response(404, json={"error": {"message": f"unrouted {request.url.path}"}})
+        if isinstance(self.reply, int):
+            return httpx.Response(self.reply, json=refused)
+        return httpx.Response(200, json=good) if key in self.good else httpx.Response(401, json=refused)
+
+
+@pytest.fixture
+def byok(fake, tmp_path):
+    """An assistant whose people may bring their own key. byok(*script, shared=[...],
+    config={...}, env={...}, **own_settings): script is what the providers' chat
+    completions stream, shared what the operator's model at llm.test does."""
+    from boom_mcp import assistant as a
+    from boom_mcp import providers
+    from boom_mcp.keystore import KeyStore
+    from starlette.applications import Starlette
+
+    from tests.test_assistant import FakeModel, say
+
+    def build(*script, shared=None, config=None, env=None, **own_settings):
+        own_model = FakeModel(*(script or [say("From your own key.")]))
+        shared_model = FakeModel(*(shared or [say("From the shared model.")]))
+        checks, hosts = FakeProviders(), []
+
+        async def route(request):
+            hosts.append(request.url.host)
+            if request.url.host == "llm.test":
+                return await shared_model(request)
+            if request.url.host in ("api.anthropic.com", "openrouter.ai"):
+                if request.url.path.endswith("/chat/completions"):
+                    return await own_model(request)
+                return checks(request)
+            return fake(request)
+
+        store = KeyStore(tmp_path / "assistant" / "keys.sqlite3", KEYS_SECRET)
+        own = a.OwnKeys(store=store, providers=providers.from_env(env or {}), **own_settings)
+        cfg = a.Config(llm=a.Endpoint("http://llm.test/v1", "test-model", "sk-model"), own_keys=own, **(config or {}))
+        bot = a.Assistant(cfg, http=httpx.AsyncClient(transport=httpx.MockTransport(route)))
+        return SimpleNamespace(
+            bot=bot, app=a.mount(Starlette(), bot), store=store, own=own_model, shared=shared_model,
+            checks=checks, babamul=fake, hosts=hosts,
+        )
+
+    return build
