@@ -19,24 +19,30 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
+import traceback
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
+from http.cookiejar import DefaultCookiePolicy
 
 import anyio
 import httpx
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from . import keystore
+from . import providers as p
 from . import summarize as s
 from .app import INSTRUCTIONS, caller, mcp, settings
 from .babamul import USER_AGENT, Babamul, base_url_from_env
+from .keystore import SHARED, KeyStore
 
 log = logging.getLogger("boom_mcp.assistant")
 
@@ -81,6 +87,8 @@ TOO_LONG = "\n\n(This answer reached its length limit, so it is cut short.)"
 LINE_FULL = "The assistant is busy with other people's questions. Try again in a few minutes."
 WAITED_TOO_LONG = "The assistant is still busy with other people's questions. Try again in a few minutes."
 REPLACED = "Stopped because you asked a new question, here or in another tab."
+# The status line's "Answering with ..." when the key store cannot be read.
+STORE_DOWN_LABEL = "the shared model: saved keys cannot be reached right now"
 
 # The part of the answer timeout the tool loop may use. The rest is kept for the
 # final answer, so running out of time still ends in an answer.
@@ -98,6 +106,10 @@ TOKEN_CACHE = 4096
 # A Bearer token as RFC 6750 spells it. Babamul's API and login tokens both fit; anything
 # else Babamul would refuse, and a byte outside ASCII would crash the request to it.
 TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}=*")
+# A login token of the Babamul web app, a JWT, as opposed to a bbml_ API token. Only
+# these may manage or spend a person's own model key: API tokens end up in notebooks
+# and repositories, and Babamul never expires them.
+LOGIN_TOKEN = re.compile(r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 # A model API key: printable ASCII with no spaces. Anything else in an Authorization
 # header makes h11 raise an error that quotes the whole header, key and all, and
 # that error would reach the logs.
@@ -111,10 +123,33 @@ OWN_HEADERS = frozenset({"accept", "authorization", "content-length", "content-t
 KINDS = ("llamacpp", "openai")
 MAX_BODY = 1_000_000
 MAX_MESSAGE_CHARS = 20_000
+# How long a person may have their key kept, in days, and the usual choice.
+KEY_DAYS = (1, 7, 30, 90)
+DEFAULT_KEY_DAYS = 30
+# Keys a person may save in an hour, each checked with the provider, so that this
+# server cannot be used to try out keys found elsewhere.
+SAVES_PER_HOUR = 10
+# Seconds between sweeps of expired keys.
+SWEEP_EVERY = 3600.0
+MAX_KEY_BODY = 16_000
 
 
 def env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_number(env, name, default):
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return type(default)(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, not {raw!r}") from None
+
+
+def is_login(token: str) -> bool:
+    return not token.startswith("bbml_") and bool(LOGIN_TOKEN.fullmatch(token))
 
 
 def check_key(key: str, what: str) -> str:
@@ -139,7 +174,8 @@ class Endpoint:
 
     kind is what the request body may hold (see chat_payload): "llamacpp", the
     operator's own server, or "openai", a hosted provider. headers are extra
-    (name, value) pairs for every request, such as a provider's workspace id.
+    (name, value) pairs for every request, such as a provider's workspace id,
+    and body extra fields for an "openai" one, such as OpenRouter's routing.
     """
 
     base_url: str
@@ -147,6 +183,7 @@ class Endpoint:
     api_key: str = field(default="", repr=False)
     kind: str = "llamacpp"
     headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    body: dict = field(default_factory=dict, repr=False, hash=False, compare=False)
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -179,6 +216,8 @@ class Config:
     rate_limit: int = 20
     rate_window: float = 600.0
     fallback_period: float = 300.0
+    # People's own keys, when the operator has set up a store for them.
+    own_keys: "OwnKeys | None" = None
 
     @classmethod
     def from_env(cls, env=None) -> "Config | None":
@@ -189,13 +228,7 @@ class Config:
             return None
 
         def number(name, default):
-            raw = env.get(name, "").strip()
-            if not raw:
-                return default
-            try:
-                return type(default)(raw)
-            except ValueError:
-                raise ValueError(f"{name} must be a number, not {raw!r}") from None
+            return env_number(env, name, default)
 
         def text(name):
             # A trailing newline from an env file would otherwise reach the model's
@@ -226,7 +259,91 @@ class Config:
             max_queue=number("ASSISTANT_MAX_QUEUE", cls.max_queue),
             rate_limit=number("ASSISTANT_RATE_LIMIT", cls.rate_limit),
             rate_window=number("ASSISTANT_RATE_WINDOW", cls.rate_window),
+            own_keys=OwnKeys.from_env(env),
         )
+
+
+@dataclass
+class OwnKeys:
+    """People's own model keys: where they are kept, which providers take them, and
+    the limits on the questions they answer.
+
+    Those questions have a line and a rate limit of their own. They do not wait
+    for the operator's model, whose slots are few, and the provider and the
+    person's spending limit their pace; these limits keep this server and
+    Babamul, where their tools run, from being swamped all the same.
+    """
+
+    store: KeyStore
+    providers: dict[str, p.Provider]
+    max_days: int = 90
+    concurrency: int = 8
+    max_queue: int = 16
+    rate_limit: int = 40
+    rate_window: float = 600.0
+    max_tokens: int = 8192
+    max_images: int = 6
+
+    @classmethod
+    def from_env(cls, env) -> "OwnKeys | None":
+        """The settings in ASSISTANT_KEYS_* and ASSISTANT_BYOK_*, or None when no store is set up."""
+        store = KeyStore.from_env(env)
+        if store is None:
+            return None
+        own = cls(
+            store=store,
+            providers=p.from_env(env),
+            max_days=env_number(env, "ASSISTANT_KEYS_MAX_DAYS", cls.max_days),
+            concurrency=env_number(env, "ASSISTANT_BYOK_CONCURRENCY", cls.concurrency),
+            max_queue=env_number(env, "ASSISTANT_BYOK_MAX_QUEUE", cls.max_queue),
+            rate_limit=env_number(env, "ASSISTANT_BYOK_RATE_LIMIT", cls.rate_limit),
+            rate_window=env_number(env, "ASSISTANT_BYOK_RATE_WINDOW", cls.rate_window),
+            max_tokens=env_number(env, "ASSISTANT_BYOK_MAX_TOKENS", cls.max_tokens),
+            max_images=env_number(env, "ASSISTANT_BYOK_MAX_IMAGES", cls.max_images),
+        )
+        if own.max_days < KEY_DAYS[0]:
+            raise ValueError(f"ASSISTANT_KEYS_MAX_DAYS must be at least {KEY_DAYS[0]}")
+        return own
+
+    @property
+    def days(self) -> list[int]:
+        return [d for d in KEY_DAYS if d <= self.max_days]
+
+    @property
+    def default_days(self) -> int:
+        return DEFAULT_KEY_DAYS if DEFAULT_KEY_DAYS in self.days else self.days[-1]
+
+    def public(self) -> dict:
+        return {
+            "providers": [provider.public() for provider in self.providers.values()],
+            "days": self.days,
+            "default_days": self.default_days,
+        }
+
+
+@dataclass(frozen=True)
+class Model:
+    """What answers one question, and how it is asked.
+
+    endpoints are tried in turn; none means the operator's model, with its
+    fallback. The rest is what the tool loop needs to know about the model:
+    whether it can see images, and how much it may read and write.
+    """
+
+    endpoints: tuple[Endpoint, ...] = ()
+    vision: bool = False
+    thinking: bool = False
+    max_tokens: int = 1024
+    context_budget: int = 60_000
+    # Images the model is shown at most, the newest; 0 for no limit.
+    max_images: int = 0
+    # For a person's own key: the provider's id and name, and what the status line calls it.
+    provider: str = ""
+    name: str = ""
+    label: str = ""
+    # Which saved key this is (its row's nonce), so that a key saved while the
+    # question runs is not marked for what happened to this one.
+    key_row: bytes = field(default=b"", repr=False)
 
 
 # The prompt.
@@ -446,7 +563,9 @@ def strip_tool_markup(text: str | None) -> str:
     return TOOL_MARKUP.sub("", text or "").strip()
 
 
-def chat_payload(model, messages, tools, thinking=False, max_tokens=0, kind="llamacpp") -> dict:
+def chat_payload(
+    model, messages, tools, thinking=False, max_tokens=0, kind="llamacpp", extra=None, tool_choice=None
+) -> dict:
     """The body of a streamed chat-completions request, for an endpoint of this kind.
 
     `tools` is omitted when empty rather than sent as []: the last round asks
@@ -460,9 +579,12 @@ def chat_payload(model, messages, tools, thinking=False, max_tokens=0, kind="lla
 
     A hosted provider ("openai") gets only standard fields: chat_template_kwargs
     is llama.cpp's own, and Anthropic refuses a temperature below 1 on its newer
-    models, so the provider's sampling defaults stay. tool_choice is never sent,
-    since Anthropic refuses a forced one. stream_options asks for the tokens used
-    in the last chunk, since on a provider someone pays for them.
+    models, so the provider's sampling defaults stay. tool_choice is never a
+    forced one, which Anthropic refuses; "none" lets the last round keep its
+    tools, since Anthropic wants tools defined while the conversation holds
+    calls to them. stream_options asks for the tokens used in the last chunk,
+    since on a provider someone pays for them. extra fields come last and
+    replace none of these.
     """
     if kind == "openai":
         payload = {"model": model, "messages": messages}
@@ -470,7 +592,11 @@ def chat_payload(model, messages, tools, thinking=False, max_tokens=0, kind="lla
             payload["max_tokens"] = max_tokens
         if tools:
             payload["tools"] = tools
+            if tool_choice == "none":
+                payload["tool_choice"] = "none"
         payload["stream_options"] = {"include_usage": True}
+        for name, value in (extra or {}).items():
+            payload.setdefault(name, value)
         return payload
     payload = {"model": model, "messages": messages, "temperature": 0}
     if max_tokens > 0:
@@ -559,12 +685,42 @@ def add_reasoning(details: list[dict], part) -> None:
     details.append(dict(part))
 
 
-def fit(messages: list[dict], budget: int) -> list[dict]:
-    """Shrink the oldest tool results until the conversation fits in budget characters.
+IMAGES_LEFT_OUT = "The images the tools above returned were shown to the person. They are left out here, to save room."
+
+
+def keep_newest_images(messages: list[dict], keep: int):
+    """Leave out all but the newest keep images.
+
+    Every image is read again in every later round, and on a person's own key
+    each costs them, so a long chat with cutouts would cost more each round.
+    """
+    seen = 0
+    for message in reversed(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept, dropped = [], 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                if seen >= keep:
+                    dropped += 1
+                    continue
+                seen += 1
+            kept.append(part)
+        if dropped:
+            images = [q for q in kept if isinstance(q, dict) and q.get("type") == "image_url"]
+            message["content"] = kept if images else IMAGES_LEFT_OUT
+
+
+def fit(messages: list[dict], budget: int, max_images: int = 0) -> list[dict]:
+    """Shrink the oldest tool results until the conversation fits in budget characters,
+    and keep only the newest max_images images when it is above 0.
 
     Ten results of 20,000 characters are more than a 32k-token model holds, and
     the server then refuses the whole request. The newest results matter most.
     """
+    if max_images > 0:
+        keep_newest_images(messages, max_images)
 
     def size(message):
         content = message.get("content")
@@ -644,17 +800,48 @@ def sse(event: dict) -> bytes:
     return f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
 
 
+def announcing(emit, message: str):
+    """emit, saying message once the model has taken the question.
+
+    Said then and not before, so that a key the provider refuses outright
+    still gets a plain error instead of a stream that starts and then fails.
+    """
+    said = False
+
+    def wrapped(event):
+        nonlocal said
+        emit(event)
+        if not said and isinstance(event, dict) and event.get("type") == "_started":
+            said = True
+            emit({"type": "status", "message": message})
+
+    return wrapped
+
+
+def add_usage(spent: dict, usage) -> None:
+    """Add a reply's usage, in OpenAI's names or Anthropic's, to the question's."""
+    if not isinstance(usage, dict):
+        return
+    for ours, theirs in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
+        value = usage.get(theirs, usage.get(ours))
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            spent[ours] = spent.get(ours, 0) + value
+
+
 # Errors.
 
 
 class ModelError(Exception):
     """The model failed. `message` is for the person; `switchable` means another
-    endpoint (or another try) might do better."""
+    endpoint (or another try) might do better. A failure of a person's own key
+    has a code, for the web app to offer a fix, and its own status."""
 
-    def __init__(self, message: str, switchable: bool = False, detail: str = ""):
+    def __init__(self, message: str, switchable: bool = False, detail: str = "", code: str = "", status: int = 503):
         super().__init__(detail or message)
         self.message = message
         self.switchable = switchable
+        self.code = code
+        self.status = status
 
 
 class OutOfTime(Exception):
@@ -674,9 +861,22 @@ class BabamulDown(Exception):
 
 
 class BadRequest(Exception):
-    def __init__(self, message: str, status: int = 400):
+    """A request refused before anyone is asked. code tells the web app what to offer."""
+
+    def __init__(self, message: str, status: int = 400, code: str = "", headers: dict | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.headers = headers
+
+
+@dataclass(frozen=True)
+class Who:
+    """Who asks: person is what their limits are kept by, account their Babamul
+    user id. Only an account, never a token's stand-in, may hold keys."""
+
+    person: str
+    account: str | None
 
 
 @dataclass
@@ -686,6 +886,7 @@ class Failure:
 
     status: int
     message: str
+    code: str = ""
 
 
 # An error type or code worth logging: a short word, never a sentence.
@@ -724,6 +925,55 @@ def refused(status: int, detail: str) -> ModelError:
     if status in (401, 403, 404):
         return ModelError(MISCONFIGURED, detail=detail)
     return ModelError(REFUSED, detail=detail)
+
+
+# What the owner of a key reads when it fails. Theirs to fix, not the Babamul team's,
+# and each says the shared model is still there, since nothing moves to it by itself.
+OWN_MESSAGES = {
+    p.KEY_MISSING: (
+        "You chose to answer with your own {name} key, but it is missing, expired or can no longer be read. "
+        "Save it again on your Profile, or ask the shared model."
+    ),
+    p.KEY_REFUSED: "{name} did not accept your key. Check it on your Profile, or ask the shared model.",
+    p.NO_CREDIT: (
+        "Your {name} account is out of credit or reached its spending limit. "
+        "Add credit or raise the limit, or ask the shared model."
+    ),
+    p.BUSY: "{name} is limiting how fast your key can ask. Try again in a minute, or ask the shared model.",
+    p.MODEL_UNAVAILABLE: (
+        "Your {name} key cannot use {model}. Pick another model on your Profile, or ask the shared model."
+    ),
+    p.DOWN: "{name} is not answering right now. Try again in a minute, or ask the shared model.",
+}
+
+
+def own_failure(code: str, name: str, model: str = "", detail: str = "", switchable: bool = False) -> ModelError:
+    """A failure of a person's own key. Never a 401, which the web app takes for a
+    Babamul login gone stale: a 503 when the provider is down, else a 422."""
+    message = OWN_MESSAGES[code].format(name=name, model=model or "that model")
+    return ModelError(
+        message, switchable=switchable, detail=detail or code, code=code, status=503 if code == p.DOWN else 422
+    )
+
+
+def own_error(exc: ModelError, model: "Model") -> ModelError:
+    """A failure on a person's own key, with a code: their provider not answering, or
+    stopping partway, is theirs to retry or to ask the shared model instead."""
+    if exc.code or exc.message not in (UNREACHABLE, STALLED):
+        return exc
+    message = exc.message if exc.message == STALLED else OWN_MESSAGES[p.DOWN].format(name=model.name)
+    return ModelError(message, detail=str(exc), code=p.DOWN, status=503)
+
+
+def own_refused(model: "Model", body, status: int | None, detail: str, said: bool) -> ModelError:
+    """A provider's error for a question on a person's key. Asked again at once only
+    when the provider itself failed (a 5xx or 529) before any text, never after a 429."""
+    code = p.classify(model.provider, body, status)
+    if code is None:
+        return ModelError(REFUSED, detail=detail)
+    status = p.status_of(p.error_of(body), status)
+    again = code == p.DOWN and status is not None and status >= 500 and not said
+    return own_failure(code, model.name, model.endpoints[0].model, f"{detail}: {code}", again)
 
 
 # Limits.
@@ -854,57 +1104,90 @@ class Assistant:
 
     def __init__(self, config: Config, *, http: httpx.AsyncClient | None = None, babamul_url: str | None = None):
         self.config = config
-        self.http = http
+        self.http = no_cookies(http) if http is not None else None
         self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
         self.line = Line(config.concurrency, config.max_queue)
         self.limiter = RateLimiter(config.rate_limit, config.rate_window)
+        self.own = config.own_keys
+        self.saves = RateLimiter(SAVES_PER_HOUR, 3600.0)
+        if self.own is not None:
+            # Questions on people's own keys never wait for the operator's model.
+            self.own_line = Line(self.own.concurrency, self.own.max_queue)
+            self.own_limiter = RateLimiter(self.own.rate_limit, self.own.rate_window)
         # Person -> (ticket, stop) of their running question; stop ends it.
         self.active: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         # Person -> the newest of their questions still taking over from the last.
         self.claims: dict[str, object] = {}
-        # sha256 of a token -> (expiry, person or None when Babamul refused it).
-        self.tokens: dict[str, tuple[float, str | None]] = {}
+        # sha256 of a token -> (expiry, who or None when Babamul refused it).
+        self.tokens: dict[str, tuple[float, Who | None]] = {}
         self._main_skipped_until = 0.0
         self._tools: list[dict] | None = None
 
     @asynccontextmanager
     async def running(self):
-        """Holds the HTTP client for the model and Babamul while the app runs."""
-        if self.http is not None:
-            yield
-            return
-        async with settings["http_client"]() as http:
-            self.http = http
-            try:
+        """Holds the HTTP client for the model and Babamul while the app runs, and
+        sweeps out expired keys."""
+        sweeper = asyncio.create_task(self.sweep_keys()) if self.own else None
+        try:
+            if self.http is not None:
                 yield
-            finally:
-                self.http = None
+            else:
+                async with settings["http_client"]() as http:
+                    self.http = no_cookies(http)
+                    try:
+                        yield
+                    finally:
+                        self.http = None
+        finally:
+            if sweeper is not None:
+                sweeper.cancel()
+                await asyncio.gather(sweeper, return_exceptions=True)
+
+    async def sweep_keys(self):
+        """Forget expired keys now and then. Reading a person's keys forgets theirs too,
+        but someone who never comes back would keep theirs."""
+        while True:
+            try:
+                if gone := await asyncio.to_thread(self.own.store.sweep):
+                    log.info("forgot %d expired model key%s", gone, "s" * (gone > 1))
+            except sqlite3.Error as exc:
+                log.error("could not sweep expired model keys: %s", type(exc).__name__)
+            await asyncio.sleep(SWEEP_EVERY)
 
     # Routes.
 
     async def health(self, request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "model": self.config.llm.model, "vision": self.config.vision})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "model": self.config.llm.model,
+                "vision": self.config.vision,
+                "own_keys": self.own.public() if self.own else None,
+            }
+        )
 
     async def chat(self, request: Request):
-        auth = request.headers.get("authorization", "")
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        if not token:
-            return error(401, "Log in to Babamul to use the assistant.")
-        if not TOKEN.fullmatch(token):
-            # Babamul would refuse it, so it is not asked.
-            return error(401, "Babamul did not accept your login. Log in again.")
         try:
-            messages, context = parse_body(await read_body(request))
+            token = bearer(request)
+            messages, context, use = parse_body(await read_body(request))
+            who = await self.identify(token)
+            model = await self.model_for(who, token, use)
         except BadRequest as exc:
-            return error(exc.status, str(exc))
-        try:
-            person = await self.person(token)
-        except BabamulDown:
-            return error(503, "Could not reach Babamul to check your login. Try again in a minute.")
-        if person is None:
-            return error(401, "Babamul did not accept your login. Log in again.")
+            return error(exc.status, str(exc), headers=exc.headers, code=exc.code)
+        except ModelError as exc:
+            # Their chosen key cannot be used. Nothing moves to the shared model by
+            # itself: they would not know which model answered, or why.
+            log.info("user %s cannot use their own key: %s", who.person, exc.code)
+            return error(exc.status, exc.message, code=exc.code)
+        except sqlite3.Error as exc:
+            return store_down(exc)
+        person = who.person
+        if model.provider:
+            line, limiter = self.own_line, self.own_limiter
+        else:
+            line, limiter = self.line, self.limiter
 
-        if (wait := self.limiter.retry_after(person)) > 0:
+        if (wait := limiter.retry_after(person)) > 0:
             minutes = math.ceil(wait / 60)
             return error(
                 429,
@@ -924,14 +1207,14 @@ class Assistant:
                 # one was asked all the same, so it still counts toward the limit.
                 return error(409, REPLACED)
             # Taken here, after the last await, so a burst cannot overfill the line.
-            if (place := self.line.join()) is None:
-                self.limiter.refund(person)
-                log.warning("turned user %s away: %d questions already waiting", person, len(self.line.waiting))
+            if (place := line.join()) is None:
+                limiter.refund(person)
+                log.warning("turned user %s away: %d questions already waiting", person, len(line.waiting))
                 return error(429, LINE_FULL, headers={"Retry-After": "60"})
 
             ticket = object()
             queue: asyncio.Queue = asyncio.Queue()
-            task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place))
+            task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place, model, line))
 
             async def stop():
                 # The Failure ends the old stream even if its task never started.
@@ -940,7 +1223,7 @@ class Assistant:
                 await asyncio.wait({task}, timeout=self.stop_grace)
                 if task.done():
                     # A task cancelled before it started never left the line itself.
-                    self.line.leave(place)
+                    line.leave(place)
 
             self.active[person] = (ticket, stop)
         finally:
@@ -950,7 +1233,7 @@ class Assistant:
         def close():
             task.cancel()
             # Also here: a task cancelled before it starts never runs its own cleanup.
-            self.line.leave(place)
+            line.leave(place)
             if self.active.get(person, (None,))[0] is ticket:
                 del self.active[person]
 
@@ -967,8 +1250,8 @@ class Assistant:
             if first.message != REPLACED:
                 # Our failure, not their choice: it does not count. A replaced one does,
                 # or asking again before each answer starts would never reach the limit.
-                self.limiter.refund(person)
-            return error(first.status, first.message)
+                limiter.refund(person)
+            return error(first.status, first.message, code=first.code)
         return EventStream(self.frames(first, queue), close)
 
     async def first_event(self, request: Request, queue: asyncio.Queue):
@@ -997,7 +1280,7 @@ class Assistant:
         item = first
         while item is not None:
             if isinstance(item, Failure):
-                yield sse({"type": "error", "message": item.message})
+                yield sse({"type": "error", "message": item.message, **({"code": item.code} if item.code else {})})
                 return
             if not item["type"].startswith("_"):
                 yield sse(item)
@@ -1010,14 +1293,30 @@ class Assistant:
     # Who is asking.
 
     async def person(self, token: str) -> str | None:
-        """The Babamul user id the token belongs to, or None when Babamul refuses it.
+        """The id a person's limits are kept by, or None when Babamul refuses the token."""
+        who = await self.who(token)
+        return who.person if who else None
+
+    async def identify(self, token: str, fresh: bool = False) -> "Who":
+        """Who the token belongs to, or BadRequest with the status to answer."""
+        try:
+            who = await self.who(token, fresh)
+        except BabamulDown:
+            raise BadRequest("Could not reach Babamul to check your login. Try again in a minute.", 503) from None
+        if who is None:
+            raise BadRequest("Babamul did not accept your login. Log in again.", 401)
+        return who
+
+    async def who(self, token: str, fresh: bool = False) -> "Who | None":
+        """Who the token belongs to, or None when Babamul refuses it.
 
         GET /profile is the cheapest call Babamul authenticates, and the id lets
-        one person's login and API tokens share their limits.
+        one person's login and API tokens share their limits. Answers are kept
+        for a while; fresh asks again, for changes to a person's keys.
         """
         key = hashlib.sha256(token.encode()).hexdigest()
         now = time.monotonic()
-        if (hit := self.tokens.get(key)) and hit[0] > now:
+        if not fresh and (hit := self.tokens.get(key)) and hit[0] > now:
             return hit[1]
         try:
             response = await self.http.get(
@@ -1038,7 +1337,10 @@ class Assistant:
             except ValueError as exc:
                 raise BabamulDown("profile is not JSON") from exc
             data = body.get("data", body) if isinstance(body, dict) else {}
-            person, ttl = str((data or {}).get("id") or key), TOKEN_TTL
+            account = (data or {}).get("id") if isinstance(data, dict) else None
+            account = str(account) if account else None
+            # Without an id, limits are kept by the token; its keys, if any, are not reachable.
+            person, ttl = Who(account or key, account), TOKEN_TTL
         if len(self.tokens) >= TOKEN_CACHE:
             self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
             if len(self.tokens) >= TOKEN_CACHE:
@@ -1056,43 +1358,206 @@ class Assistant:
             log.info("user %s asked again, so their running question stops", person)
             await entry[1]()
 
+    # People's own keys. Write-only: no route answers with a key, or anything sealed
+    # from one. Only the web app's login tokens may use them, and a change asks
+    # Babamul afresh who the token belongs to.
+
+    async def keys_route(self, request: Request, handle, fresh: bool = True) -> Response:
+        """Run handle(request, account) for a person logged in to the web app."""
+        if self.own is None:
+            return error(404, "Personal model keys are not turned on here.", code="not_found")
+        try:
+            token = bearer(request)
+            if not is_login(token):
+                raise BadRequest(
+                    "Manage model keys from the Babamul web app. Babamul API tokens cannot use them.",
+                    403,
+                    "login_required",
+                )
+            who = await self.identify(token, fresh)
+            if not who.account:
+                # Never by the token's stand-in id: a new login would lose the keys, or find another's.
+                raise BadRequest(
+                    "Babamul did not say which account this is, so keys cannot be kept for it.", 403, "no_account"
+                )
+            return await handle(request, who.account)
+        except BadRequest as exc:
+            return error(exc.status, str(exc), headers=exc.headers, code=exc.code)
+        except sqlite3.Error as exc:
+            return store_down(exc)
+
+    def provider(self, name) -> p.Provider:
+        if isinstance(name, str) and (provider := self.own.providers.get(name)):
+            return provider
+        raise BadRequest("That model provider is not offered here.", 404, "not_found")
+
+    def shown_keys(self, account: str) -> dict:
+        """The person's choice and keys, as GET /keys answers. A choice of a provider no
+        longer offered counts as the shared model."""
+        store, offered = self.own.store, list(self.own.providers)
+        use = store.use(account)
+        keys = [e for e in store.entries(account) if e["provider"] in offered]
+        keys.sort(key=lambda e: offered.index(e["provider"]))
+        return {"use": use if use in offered else SHARED, "keys": keys}
+
+    async def list_keys(self, request: Request) -> Response:
+        async def handle(request, account):
+            return JSONResponse(await asyncio.to_thread(self.shown_keys, account))
+
+        return await self.keys_route(request, handle, fresh=False)
+
+    async def save_key(self, request: Request) -> Response:
+        async def handle(request, account):
+            provider = self.provider(request.path_params.get("provider"))
+            body = await key_body(request)
+            try:
+                key = provider.check_format(body.get("key"))
+            except p.BadKey as exc:
+                raise BadRequest(str(exc), 400, "bad_format") from None
+            model = self.model_named(provider, body.get("model", provider.default_model))
+            days = body.get("days", self.own.default_days)
+            if isinstance(days, bool) or not isinstance(days, int) or days not in self.own.days:
+                choices = ", ".join(map(str, self.own.days))
+                raise BadRequest(f"Keep a key for one of {choices} days.", 400, "bad_days")
+            workspace = body.get("workspace_id") if provider.workspace_field else None
+            if isinstance(workspace, str) and workspace.strip():
+                workspace = workspace.strip()
+                if not p.WORKSPACE_ID.fullmatch(workspace):
+                    raise BadRequest("A workspace id looks like wrkspc_ and letters and digits.", 400, "bad_format")
+            elif workspace is not None and workspace != "":
+                raise BadRequest("workspace_id must be text.", 400, "bad_format")
+            else:
+                workspace = None
+            use = body.get("use", True)
+            if not isinstance(use, bool):
+                raise BadRequest("use must be true or false.", 400, "bad_format")
+
+            # Counted before the provider is asked, failed checks included.
+            if (wait := self.saves.retry_after(account)) > 0:
+                minutes = math.ceil(wait / 60)
+                raise BadRequest(
+                    f"That is a lot of keys in an hour. Try again in {minutes} minute{'s' * (minutes > 1)}.",
+                    429,
+                    "too_many_saves",
+                    {"Retry-After": str(math.ceil(wait))},
+                )
+            try:
+                await provider.check_key(self.http, key, model, workspace)
+            except p.KeyRejected as exc:
+                raise BadRequest(str(exc), 422, "rejected") from None
+            except p.ProviderUnreachable as exc:
+                raise BadRequest(str(exc), 502, "provider_unreachable") from None
+            entry = await asyncio.to_thread(self.own.store.save, account, provider.id, key, model, days, workspace, use)
+            log.info("user %s saved their %s key for %d days", account, provider.name, days)
+            return JSONResponse(entry)
+
+        return await self.keys_route(request, handle)
+
+    def model_named(self, provider: p.Provider, model) -> str:
+        if model not in provider.models:
+            offered = ", ".join(provider.models)
+            raise BadRequest(f"Pick one of the {provider.name} models offered: {offered}.", 400, "bad_model")
+        return model
+
+    async def choose(self, request: Request) -> Response:
+        async def handle(request, account):
+            body = await key_body(request)
+            use = body.get("use")
+            if not isinstance(use, str):
+                raise BadRequest('use is "shared" or a provider.', 400, "bad_format")
+            if use == SHARED:
+                await asyncio.to_thread(self.own.store.set_use, account, SHARED)
+                return JSONResponse({"use": SHARED})
+            provider = self.provider(use)
+            model = body.get("model")
+            if model is not None:
+                self.model_named(provider, model)
+            entries = await asyncio.to_thread(self.own.store.entries, account)
+            if not any(e["provider"] == provider.id and e["state"] == "ok" for e in entries):
+                raise BadRequest(f"Save your {provider.name} key first.", 409, "no_key")
+            await asyncio.to_thread(self.own.store.set_use, account, provider.id, model)
+            log.info("user %s chose their %s key", account, provider.name)
+            return JSONResponse({"use": provider.id})
+
+        return await self.keys_route(request, handle)
+
+    async def delete_key(self, request: Request) -> Response:
+        async def handle(request, account):
+            provider = self.provider(request.path_params.get("provider"))
+            await asyncio.to_thread(self.own.store.delete, account, provider.id)
+            log.info("user %s removed their %s key", account, provider.name)
+            return Response(status_code=204)
+
+        return await self.keys_route(request, handle)
+
+    async def delete_keys(self, request: Request) -> Response:
+        async def handle(request, account):
+            await asyncio.to_thread(self.own.store.delete_all, account)
+            log.info("user %s removed all their keys", account)
+            return Response(status_code=204)
+
+        return await self.keys_route(request, handle)
+
     # Answering.
 
-    async def run(self, messages, context, token, person, emit, place: Place):
-        """Answer one question once it has its turn, every event and then None into emit."""
+    async def run(self, messages, context, token, person, emit, place: Place, model: Model, line: Line):
+        """Answer one question once it has its turn in line, every event and then None into emit."""
         started = time.monotonic()
         try:
-            if not await self.wait_turn(place, emit):
+            if not await self.wait_turn(place, emit, line):
                 log.warning("user %s gave up waiting in line after %.0f s", person, time.monotonic() - started)
                 emit(Failure(429, WAITED_TOO_LONG))
                 return
             waited = time.monotonic() - started
-            calls = await self.answer(messages, context, token, emit)
+            if model.provider:
+                await self.note_key(person, model, "touch")
+            calls = await self.answer(messages, context, token, emit, model)
             log.info(
-                "answered user %s in %.1f s (%.1f s in line) with %d tool calls",
+                "answered user %s in %.1f s (%.1f s in line) with %d tool calls%s",
                 person,
                 time.monotonic() - started,
                 waited,
                 calls,
+                f" on their {model.name} key" if model.provider else "",
             )
         except ModelError as exc:
+            if model.provider:
+                exc = own_error(exc, model)
             log.warning("model failed for user %s: %s", person, exc)
-            emit(Failure(503, exc.message))
-        except Exception:
-            log.exception("the assistant failed for user %s", person)
+            if exc.code == p.KEY_REFUSED:
+                # Shown on their Profile, and not tried again until they save it anew.
+                await self.note_key(person, model, "mark", keystore.REFUSED)
+            emit(Failure(exc.status, exc.message, exc.code))
+        except Exception as exc:
+            if model.provider:
+                # The traceback, without the key: an error's message may quote a request.
+                text = "".join(traceback.format_exception(exc))
+                if key := model.endpoints[0].api_key:
+                    text = text.replace(key, "(their key)")
+                log.error("the assistant failed for user %s on their own key:\n%s", person, text.rstrip())
+            else:
+                log.exception("the assistant failed for user %s", person)
             emit(Failure(500, BROKEN))
         finally:
-            self.line.leave(place)
+            line.leave(place)
             emit(None)
 
-    async def wait_turn(self, place: Place, emit) -> bool:
+    async def note_key(self, person: str, model: Model, what: str, *args):
+        """Write down the use of a person's key; a store that fails does not stop the answer."""
+        try:
+            store = self.own.store
+            await asyncio.to_thread(getattr(store, what), person, model.provider, *args, nonce=model.key_row or None)
+        except sqlite3.Error as exc:
+            log.error("could not note the use of a key: %s", type(exc).__name__)
+
+    async def wait_turn(self, place: Place, emit, line: Line) -> bool:
         """Wait for place to reach the model, telling the person where they are in
         line. False when that takes longer than the queue timeout."""
         give_up = time.monotonic() + self.config.queue_timeout
         while not place.admitted:
             if (left := give_up - time.monotonic()) <= 0:
                 return False
-            emit({"type": "status", "message": waiting_message(self.line.ahead(place))})
+            emit({"type": "status", "message": waiting_message(line.ahead(place))})
             place.moved.clear()
             try:
                 # Said again now and then, or the heartbeat's "Still working" replaces it.
@@ -1109,20 +1574,89 @@ class Assistant:
             self._tools = [openai_tool(t) for t in listed if t.annotations and t.annotations.read_only_hint]
         return self._tools
 
-    async def answer(self, messages, context, token, emit) -> int:
+    def shared_model(self, label: str = "") -> Model:
+        """The operator's model, which answers everyone who has not chosen their own.
+        With a label, the status line says so."""
+        cfg = self.config
+        return Model(
+            vision=cfg.vision,
+            thinking=cfg.thinking,
+            max_tokens=cfg.max_tokens,
+            context_budget=cfg.context_budget,
+            label=label,
+        )
+
+    async def model_for(self, who: Who, token: str, use: str | None) -> Model:
+        """The model that answers this question: the shared one, or the person's own key
+        when they chose it and ask from the web app, not with an API token.
+
+        Raises ModelError (a 422 with a code) when they chose their key and it
+        cannot be used. The key is opened here for this question only, and goes
+        no further than its Endpoint.
+        """
+        if self.own is None or use == SHARED or not who.account or not is_login(token):
+            return self.shared_model()
+        store = self.own.store
+        try:
+            choice = await asyncio.to_thread(store.use, who.account)
+        except sqlite3.Error as exc:
+            # The shared model never depends on the key store. The status line says
+            # why, since this person may have chosen their own key.
+            log.error("the key store failed, so user %s gets the shared model: %s", who.person, type(exc).__name__)
+            return self.shared_model(STORE_DOWN_LABEL)
+        provider = self.own.providers.get(choice)
+        if provider is None:  # the shared model, or a provider no longer offered
+            return self.shared_model()
+        saved = await asyncio.to_thread(store.key, who.account, provider.id)
+        if saved is None or saved.state == keystore.UNREADABLE:
+            raise own_failure(p.KEY_MISSING, provider.name)
+        if saved.state == keystore.REFUSED:
+            raise own_failure(p.KEY_REFUSED, provider.name)
+        if saved.model not in provider.models:
+            raise own_failure(p.MODEL_UNAVAILABLE, provider.name, saved.model)
+        try:
+            endpoint = Endpoint(
+                provider.base_url,
+                saved.model,
+                saved.key,
+                kind="openai",
+                headers=provider.request_headers(saved.workspace_id),
+                body=provider.body,
+            )
+        except ValueError:
+            # Its form was checked when it was saved, so this is a row gone wrong.
+            raise own_failure(p.KEY_MISSING, provider.name) from None
+        return Model(
+            endpoints=(endpoint,),
+            vision=True,
+            max_tokens=self.own.max_tokens,
+            context_budget=self.config.context_budget,
+            max_images=self.own.max_images,
+            provider=provider.id,
+            name=provider.name,
+            label=f"your {provider.name} key {saved.hint} ({saved.model})",
+            key_row=saved.nonce,
+        )
+
+    async def answer(self, messages, context, token, emit, model: Model | None = None) -> int:
         """Run the tool loop for the last question in messages, emitting events.
 
         Returns the number of tool calls it made.
         """
+        model = model or self.shared_model()
+        if model.label:
+            emit = announcing(emit, f"Answering with {model.label}")
         tools = await self.tools()
         offered = {t["function"]["name"] for t in tools}
         cfg = self.config
-        convo = [{"role": "system", "content": system_prompt(context, cfg.vision)}, *messages[-cfg.max_messages :]]
+        convo = [{"role": "system", "content": system_prompt(context, model.vision)}, *messages[-cfg.max_messages :]]
         # The question has its place on the model by now, so time spent in line
         # is not taken from its answer.
         start = time.monotonic()
         deadline = start + cfg.answer_timeout
         tools_until = start + cfg.answer_timeout * TOOL_SHARE
+        # Tokens a person's own key spent on this question, as the provider counts them.
+        spent: dict[str, int] = {}
 
         def finish(text, note="", empty=NO_ANSWER):
             text = strip_tool_markup(text)
@@ -1132,9 +1666,13 @@ class Assistant:
                 # Say so, or a sentence cut off mid-word reads like the whole answer.
                 emit({"type": "text", "delta": note})
                 text += note
-            emit({"type": "done", "content": text})
+            done = {"type": "done", "content": text}
+            if spent:
+                done["usage"] = {name: spent.get(name, 0) for name in ("input_tokens", "output_tokens")}
+            emit(done)
 
         def ending(message):
+            add_usage(spent, message.pop("usage", None))
             return TOO_LONG if message.pop("finish_reason", None) == "length" else ""
 
         reset = caller.set(Babamul(self.http, token, self.babamul_url))
@@ -1144,7 +1682,7 @@ class Assistant:
             calls_made = 0
             while calls_made < cfg.max_tool_calls and time.monotonic() < tools_until:
                 try:
-                    message = await self.round(convo, tools, tools_until, emit, talking_until=deadline)
+                    message = await self.round(model, convo, tools, tools_until, emit, talking_until=deadline)
                 except OutOfTime as exc:
                     if strip_tool_markup(exc.said):
                         # It was answering, and ran on to the deadline: keep what it said.
@@ -1168,17 +1706,21 @@ class Assistant:
                         content = "Not run: this question ran out of time for tools."
                     else:
                         calls_made += 1
-                        content, images = await self.call(call, offered, tools_until, emit)
+                        content, images = await self.call(call, offered, tools_until, emit, model)
                         seen += images
                     convo.append({"role": "tool", "tool_call_id": call["id"], "content": content})
-                if seen and cfg.vision:
+                if seen and model.vision:
                     convo.append(image_message(seen))
 
             # The cap or the clock stopped the tools: ask once more without them,
-            # or the model asks for another instead of answering.
+            # or the model asks for another instead of answering. A provider keeps
+            # them with tool_choice "none" (see chat_payload); llama.cpp, as ever, is not offered them.
             convo.append({"role": "user", "content": ANSWER_NOW})
             try:
-                message = await self.round(convo, [], deadline, emit)
+                if model.provider:
+                    message = await self.round(model, convo, tools, deadline, emit, tool_choice="none")
+                else:
+                    message = await self.round(model, convo, [], deadline, emit)
                 finish(message.get("content"), ending(message))
             except OutOfTime as exc:
                 finish(exc.said, CUT_SHORT, empty=OUT_OF_TIME)
@@ -1186,7 +1728,7 @@ class Assistant:
         finally:
             caller.reset(reset)
 
-    async def call(self, call, offered, until, emit) -> tuple[str, list[dict]]:
+    async def call(self, call, offered, until, emit, model: Model) -> tuple[str, list[dict]]:
         """Run one tool call; the text for the model and the images it returned."""
         name, call_id = call["function"]["name"], call["id"]
         try:
@@ -1229,7 +1771,7 @@ class Assistant:
             n = f"{len(images)} image{'s' * (len(images) > 1)}"
             note = (
                 f"[{n} shown to the person in the chat, and attached below for you.]"
-                if self.config.vision
+                if model.vision
                 else f"[{n} shown to the person in the chat. You cannot see {'them' if len(images) > 1 else 'it'}.]"
             )
             content = f"{note}\n{content}"
@@ -1252,8 +1794,11 @@ class Assistant:
         detail = f"{type(cause).__name__}: {cause}"[:200]
         return f"tool {name} crashed ({detail}). Calling it again with the same arguments will fail the same way."
 
-    def endpoints(self) -> list[Endpoint]:
+    def endpoints(self, model: Model | None = None) -> list[Endpoint]:
         """Where to send one round, in the order to try them."""
+        if model is not None and model.endpoints:
+            # Each is given a second chance, as the operator's model is without a fallback.
+            return [e for endpoint in model.endpoints for e in (endpoint, endpoint)]
         main, fallback = self.config.llm, self.config.fallback
         if fallback is None:
             return [main, main]
@@ -1261,7 +1806,7 @@ class Assistant:
             return [fallback, main]
         return [main, fallback]
 
-    async def round(self, messages, tools, until, emit, talking_until=None) -> dict:
+    async def round(self, model: Model, messages, tools, until, emit, talking_until=None, tool_choice=None) -> dict:
         """One model round, moved to the other endpoint if the first fails before saying anything.
 
         Raises OutOfTime when the clock reaches until, and ModelError when no
@@ -1269,10 +1814,10 @@ class Assistant:
         to talking_until: cutting it at until would throw away an answer the
         person is watching arrive, and ask for it again with less time.
         """
-        fit(messages, self.config.context_budget)
+        fit(messages, model.context_budget, model.max_images)
         failure: ModelError | None = None
         tried, again = None, True
-        for endpoint in self.endpoints():
+        for endpoint in self.endpoints(model):
             if endpoint is tried and not again:
                 break
             if (left := until - time.monotonic()) <= 0:
@@ -1287,7 +1832,7 @@ class Assistant:
                         def extend():
                             timer.reschedule(later)
 
-                    return await self.stream(endpoint, messages, tools, emit, said, extend)
+                    return await self.stream(model, endpoint, messages, tools, emit, said, extend, tool_choice)
             except TimeoutError:
                 raise OutOfTime("".join(said)) from None
             except Stalled as exc:
@@ -1308,23 +1853,27 @@ class Assistant:
                     raise ModelError(STALLED, detail=type(exc).__name__) from None
                 failure = ModelError(UNREACHABLE, switchable=True, detail=type(exc).__name__)
             log.warning("model at %s failed: %s", shown_url(endpoint.base_url), failure)
-            if endpoint is self.config.llm and self.config.fallback is not None:
+            if not model.endpoints and endpoint is self.config.llm and self.config.fallback is not None:
+                # Only the operator's own failures move everyone to the fallback.
                 self._main_skipped_until = time.monotonic() + self.config.fallback_period
         if failure is not None:
             raise failure
         raise OutOfTime()
 
-    async def stream(self, endpoint: Endpoint, messages, tools, emit, said: list[str], on_text=None) -> dict:
+    async def stream(
+        self, model: Model, endpoint: Endpoint, messages, tools, emit, said: list[str], on_text=None, tool_choice=None
+    ) -> dict:
         """One streamed chat completion, its text emitted as it arrives.
 
         on_text is called when the first text arrives. The message returned also
-        has the reply's finish_reason, which the caller takes out.
+        has the reply's finish_reason, and on a person's own key the tokens it
+        used, which the caller takes out.
         """
         cfg = self.config
-        payload = {
-            **chat_payload(endpoint.model, messages, tools, cfg.thinking, cfg.max_tokens, endpoint.kind),
-            "stream": True,
-        }
+        payload = chat_payload(
+            endpoint.model, messages, tools, model.thinking, model.max_tokens, endpoint.kind, endpoint.body, tool_choice
+        )
+        payload["stream"] = True
         headers = {"Accept": "text/event-stream", **dict(endpoint.headers)}
         if endpoint.api_key:
             # Checked again here, so a key that cannot be sent never reaches h11.
@@ -1347,7 +1896,8 @@ class Assistant:
                 # whether the context was too long or a tool schema was rejected.
                 # The error's type and code tell them apart; the rest of the body
                 # is not logged, since a provider may quote the key it refused.
-                why = error_fields(await response.aread())
+                body = await response.aread()
+                why = error_fields(body)
                 log.warning(
                     "model at %s refused the request: %s %s (messages=%d, tools=%d, %d chars)",
                     shown_url(endpoint.base_url),
@@ -1357,15 +1907,18 @@ class Assistant:
                     len(tools),
                     len(json.dumps(messages)) + len(json.dumps(tools)),
                 )
+                if model.provider:
+                    raise own_refused(model, body, response.status_code, f"{response.status_code} {why}", bool(said))
                 raise refused(response.status_code, f"{response.status_code} {why}")
             kind = response.headers.get("content-type", "")
             if not kind.startswith("text/event-stream"):
                 # A proxy's login or error page, sent with a 200. Its body is not
                 # logged: it is not ours to keep, and the type says enough.
                 log.warning("model at %s answered %r, not a stream", shown_url(endpoint.base_url), kind[:100])
-                raise ModelError(UNREACHABLE, switchable=True, detail=f"content-type {kind[:100]!r}")
+                # A person's provider is asked again only when it failed outright.
+                raise ModelError(UNREACHABLE, switchable=not model.provider, detail=f"content-type {kind[:100]!r}")
             emit({"type": "_started"})
-            deltas, finish, ended, started = [], None, False, False
+            deltas, finish, ended, started, usage = [], None, False, False, None
             async with aclosing(response.aiter_lines()) as lines:
                 while True:
                     try:
@@ -1393,7 +1946,19 @@ class Assistant:
                     except ValueError:
                         continue
                     if chunk.get("error"):
+                        # A provider that has sent its 200 reports any failure here,
+                        # out of credit or rate limited included.
+                        status = p.status_of(p.error_of(chunk))
+                        if model.provider and (p.classify(model.provider, chunk) or (status or 0) // 100 == 4):
+                            raise own_refused(model, chunk, None, error_fields(chunk), bool(said))
+                        if model.provider and not said:
+                            # The provider failed after its 200, as OpenRouter says with
+                            # {"code": "server_error"} and finish_reason "error": asked
+                            # once more, as after a 5xx before any text.
+                            raise own_failure(p.DOWN, model.name, endpoint.model, error_fields(chunk), switchable=True)
                         raise ModelError(STALLED, switchable=not said, detail=error_fields(chunk))
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]  # in the last chunk, for the whole reply
                     for choice in (chunk.get("choices") or [])[:1]:
                         finish = choice.get("finish_reason") or finish
                         delta = choice.get("delta") or {}
@@ -1415,24 +1980,60 @@ class Assistant:
             log.warning("model at %s sent an empty reply", shown_url(endpoint.base_url))
         message = merge_deltas(deltas)
         message["finish_reason"] = finish
+        if model.provider:
+            message["usage"] = usage
         return message
 
 
-async def read_body(request: Request) -> bytes:
+def no_cookies(http: httpx.AsyncClient) -> httpx.AsyncClient:
+    """http, made to keep no cookies. It asks for everyone, with their own key or
+    token, so a cookie set in answer to one person must not go out with the next."""
+    http.cookies.jar.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    return http
+
+
+def bearer(request: Request) -> str:
+    """The Babamul token a request carries, or BadRequest (401) without asking Babamul,
+    when there is none or Babamul would refuse it."""
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        raise BadRequest("Log in to Babamul to use the assistant.", 401)
+    if not TOKEN.fullmatch(token):
+        raise BadRequest("Babamul did not accept your login. Log in again.", 401)
+    return token
+
+
+async def read_body(request: Request, limit: int | None = None, too_long: str = "") -> bytes:
     """The request body, refused as soon as it is too long rather than once it is all in memory."""
-    too_long = BadRequest("The conversation is too long. Start a new chat.", 413)
+    limit = MAX_BODY if limit is None else limit
+    too_long = BadRequest(too_long or "The conversation is too long. Start a new chat.", 413)
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY:
+    if declared.isdigit() and int(declared) > limit:
         raise too_long
     body = bytearray()
     async for part in request.stream():
         body += part
-        if len(body) > MAX_BODY:
+        if len(body) > limit:
             raise too_long
     return bytes(body)
 
 
-def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
+async def key_body(request: Request) -> dict:
+    """The JSON object a key route was sent. Errors never quote it: it may hold a key."""
+    raw = await read_body(request, MAX_KEY_BODY, "That request is too long for a key.")
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.", 400, "bad_format")
+    return body
+
+
+def parse_body(raw: bytes) -> tuple[list[dict], dict | None, str | None]:
+    """The conversation, the page's context, and "shared" when the person asks the
+    shared model this once instead of their own key."""
     if len(raw) > MAX_BODY:
         raise BadRequest("The conversation is too long. Start a new chat.", 413)
     try:
@@ -1459,11 +2060,22 @@ def parse_body(raw: bytes) -> tuple[list[dict], dict | None]:
     context = body.get("context")
     if context is not None and not isinstance(context, dict):
         raise BadRequest("context must be an object.")
-    return turns, context
+    use = body.get("use")
+    if use is not None and use != SHARED:
+        raise BadRequest('use may only be "shared", to ask the shared model this once.')
+    return turns, context, use
 
 
-def error(status: int, message: str, headers: dict | None = None) -> JSONResponse:
-    return JSONResponse({"error": message}, status_code=status, headers=headers)
+def store_down(exc: sqlite3.Error) -> JSONResponse:
+    log.error("the key store failed: %s", type(exc).__name__)
+    return error(503, "Saved keys cannot be reached right now. Try again in a minute.", code="store_unavailable")
+
+
+def error(status: int, message: str, headers: dict | None = None, code: str = "") -> JSONResponse:
+    body = {"error": message}
+    if code:
+        body["code"] = code
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def mount(app, assistant: Assistant, prefix: str = "/assistant"):
@@ -1472,6 +2084,12 @@ def mount(app, assistant: Assistant, prefix: str = "/assistant"):
     app.router.routes[0:0] = [
         Route(f"{prefix}/health", assistant.health, methods=["GET"]),
         Route(f"{prefix}/chat", assistant.chat, methods=["POST"]),
+        # GET, POST and DELETE only: the CORS settings in server.py allow no others.
+        Route(f"{prefix}/keys", assistant.list_keys, methods=["GET"]),
+        Route(f"{prefix}/keys", assistant.delete_keys, methods=["DELETE"]),
+        Route(f"{prefix}/keys/{{provider}}", assistant.save_key, methods=["POST"]),
+        Route(f"{prefix}/keys/{{provider}}", assistant.delete_key, methods=["DELETE"]),
+        Route(f"{prefix}/choice", assistant.choose, methods=["POST"]),
     ]
     inner = app.router.lifespan_context
 

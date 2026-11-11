@@ -22,6 +22,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     MPLCONFIGDIR=/tmp/matplotlib \
     PYTHONUNBUFFERED=1
 
+# Where a volume for people's own model keys goes (ASSISTANT_KEYS_DB=/data/keys.sqlite3).
+# A new named volume takes this directory's owner.
+RUN mkdir -m 700 /data && chown nobody /data
+
 USER nobody
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s \

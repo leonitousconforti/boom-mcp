@@ -8,6 +8,7 @@ dependencies = [
     "httpx",
     "numpy",
     "astropy",
+    "cryptography",
     "matplotlib",
     "python-dotenv",
     "starlette",

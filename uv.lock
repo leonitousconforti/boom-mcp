@@ -96,6 +96,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "astropy" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "matplotlib" },
     { name = "mcp" },
@@ -121,6 +122,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'agent'", specifier = ">=2.6,<3" },
     { name = "astropy" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "matplotlib" },
     { name = "mcp", specifier = ">=2.3,<3" },

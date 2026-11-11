@@ -453,6 +453,17 @@ async def test_fallback_on_server_error_then_prefers_it(make):
     assert len(t.model.requests) == 1  # the main one is skipped for a while
 
 
+async def test_a_model_of_its_own_never_moves_to_the_fallback(make):
+    t = make(503, fallback=[say("From the backup.")])
+    own = a.Model(endpoints=(a.Endpoint("http://llm.test/v1", "own-model"),), max_tokens=50)
+    with pytest.raises(a.ModelError) as failed:
+        await t.bot.answer([{"role": "user", "content": "hi"}], None, "bbml_test", [].append, own)
+    assert failed.value.message == a.UNREACHABLE
+    assert [r.body["model"] for r in t.model.requests] == ["own-model"] * 2  # asked again once, there
+    assert t.backup.requests == [] and t.bot._main_skipped_until == 0  # the operator's model is untouched
+    assert t.model.requests[0].body["max_tokens"] == 50
+
+
 async def test_fallback_on_connection_error(make):
     t = make(httpx.ConnectError("refused"), fallback=[say("From the backup.")])
     assert events(await ask(app_of(t.bot)))[-1]["content"] == "From the backup."
@@ -513,7 +524,7 @@ async def test_health_and_routes_only_when_enabled(make):
     args.assistant_prefix = "/api/assistant/"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(http_app(args)), base_url="http://boom") as client:
         response = await client.get("/api/assistant/health")
-    assert response.json() == {"status": "ok", "model": "qwen", "vision": True}
+    assert response.json() == {"status": "ok", "model": "qwen", "vision": True, "own_keys": None}
 
 
 # A raw ASGI request, to control when the client leaves, the way uvicorn reports it.
