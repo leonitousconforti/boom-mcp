@@ -105,7 +105,9 @@ export ASSISTANT_LLM_API_KEY=   # empty for a local llama.cpp without --api-key
 boom-mcp --http --assistant
 ```
 
-This adds two routes next to `/mcp`, under `/assistant` (change it with `--assistant-prefix`):
+This adds routes next to `/mcp`, under `/assistant` (change it with `--assistant-prefix`): these
+two, and the key routes listed under [people's own model keys](#peoples-own-model-keys) when those
+are on.
 
 - `GET /assistant/health` returns `{"status": "ok", "model": "...", "vision": false, "own_keys": null}`.
   When the assistant is off the route does not exist, and the web app hides its button.
@@ -203,7 +205,7 @@ Whoever runs or breaks into this server can read the keys in use: tell the peopl
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `ASSISTANT_KEYS_DB` | unset | The SQLite file. Its directory is made 0700 and the file 0600 |
+| `ASSISTANT_KEYS_DB` | unset | The SQLite file. A missing directory is made 0700; the file is made 0600 |
 | `ASSISTANT_KEYS_SECRET_FILE` | unset | A file only this user can read, holding 32 random bytes in base64 |
 | `ASSISTANT_KEYS_SECRET` | unset | The same secret as a variable, for a container. The file wins |
 | `ASSISTANT_KEYS_OLD_SECRET_FILE` | unset | A previous secret, while keys move to the new one |
