@@ -161,7 +161,9 @@ class KeyStore:
             db.executescript(SCHEMA)
 
     def _connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        # Never made here (mode=rw): a file removed while the server runs would come
+        # back empty, with no tables and the umask's mode. _create makes it.
+        db = sqlite3.connect(f"{self.path.absolute().as_uri()}?mode=rw", uri=True, timeout=10)
         db.execute("PRAGMA secure_delete=ON")
         return _Connection(db)
 

@@ -171,6 +171,15 @@ def test_the_file_is_private_and_holds_no_key(tmp_path, clock, open_umask):
     assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o600
 
 
+def test_a_file_removed_while_running_is_not_made_again(store):
+    store.save("user-1", "anthropic", FAKE_KEY, "claude-haiku-5-5", 30)
+    store.path.unlink()
+    with pytest.raises(sqlite3.OperationalError):
+        store.use("user-1")
+    # Made again, it would have no tables, and the umask's mode rather than 0600.
+    assert not store.path.exists()
+
+
 def test_a_deleted_key_is_overwritten_in_the_file(tmp_path, clock, monkeypatch):
     # Some SQLite builds overwrite deleted rows by default, and most do not: start
     # every connection with it off, so the store has to turn it on itself.

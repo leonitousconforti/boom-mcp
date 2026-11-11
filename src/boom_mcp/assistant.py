@@ -86,6 +86,8 @@ TOO_LONG = "\n\n(This answer reached its length limit, so it is cut short.)"
 LINE_FULL = "The assistant is busy with other people's questions. Try again in a few minutes."
 WAITED_TOO_LONG = "The assistant is still busy with other people's questions. Try again in a few minutes."
 REPLACED = "Stopped because you asked a new question, here or in another tab."
+# The status line's "Answering with ..." when the key store cannot be read.
+STORE_DOWN_LABEL = "the shared model: saved keys cannot be reached right now"
 
 # The part of the answer timeout the tool loop may use. The rest is kept for the
 # final answer, so running out of time still ends in an answer.
@@ -1567,11 +1569,16 @@ class Assistant:
             self._tools = [openai_tool(t) for t in listed if t.annotations and t.annotations.read_only_hint]
         return self._tools
 
-    def shared_model(self) -> Model:
-        """The operator's model, which answers everyone who has not chosen their own."""
+    def shared_model(self, label: str = "") -> Model:
+        """The operator's model, which answers everyone who has not chosen their own.
+        With a label, the status line says so."""
         cfg = self.config
         return Model(
-            vision=cfg.vision, thinking=cfg.thinking, max_tokens=cfg.max_tokens, context_budget=cfg.context_budget
+            vision=cfg.vision,
+            thinking=cfg.thinking,
+            max_tokens=cfg.max_tokens,
+            context_budget=cfg.context_budget,
+            label=label,
         )
 
     async def model_for(self, who: Who, token: str, use: str | None) -> Model:
@@ -1585,7 +1592,14 @@ class Assistant:
         if self.own is None or use == SHARED or not who.account or not is_login(token):
             return self.shared_model()
         store = self.own.store
-        provider = self.own.providers.get(await asyncio.to_thread(store.use, who.account))
+        try:
+            choice = await asyncio.to_thread(store.use, who.account)
+        except sqlite3.Error as exc:
+            # The shared model never depends on the key store. The status line says
+            # why, since this person may have chosen their own key.
+            log.error("the key store failed, so user %s gets the shared model: %s", who.person, type(exc).__name__)
+            return self.shared_model(STORE_DOWN_LABEL)
+        provider = self.own.providers.get(choice)
         if provider is None:  # the shared model, or a provider no longer offered
             return self.shared_model()
         saved = await asyncio.to_thread(store.key, who.account, provider.id)

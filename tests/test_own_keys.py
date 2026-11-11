@@ -278,6 +278,24 @@ async def test_a_chosen_key_that_cannot_be_used_never_falls_back(byok):
     assert t.shared.requests and t.own.requests == []
 
 
+async def test_a_broken_store_leaves_everyone_the_shared_model(byok, caplog):
+    t = byok()
+    await save(t)
+    t.store.path.unlink()  # removed while the server runs
+    for token in ("bbml_test", LOGIN):
+        evs = events(await ask(t.app, token=token))
+        assert evs[-1] == {"type": "done", "content": "From the shared model."}, token
+    # They may have chosen their own key, so the status line says why it is not used.
+    assert evs[0] == {"type": "status", "message": f"Answering with {a.STORE_DOWN_LABEL}"}
+    assert t.own.requests == [] and len(t.shared.requests) == 2
+    assert "the key store failed, so user user-1 gets the shared model: OperationalError" in caplog.text
+    assert not t.store.path.exists()  # not made again, empty
+
+    t.store.path.mkdir()  # SQLite cannot open a directory
+    t.babamul.tokens[LOGIN_TWO] = "user-2"  # who never saved a key
+    assert events(await ask(t.app, token=LOGIN_TWO))[-1]["content"] == "From the shared model."
+
+
 async def test_an_own_key_question_does_not_wait_for_the_shared_line(byok):
     gate = asyncio.Event()
     t = byok(say("From your own key."), shared=[stream(say("Busy "), gate, say("done."))],

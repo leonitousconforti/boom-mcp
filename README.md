@@ -237,6 +237,9 @@ A proxy in front that lists the paths it lets through needs the key routes too:
   `own_provider_down`; after, an `error` event with the same `code`. The first `status` says
   which key answers ("Answering with your Anthropic key …ab12 (claude-haiku-5-5)"), and `done`
   carries `usage` (`input_tokens`, `output_tokens`).
+- When the database cannot be read, the key routes answer 503 `store_unavailable`, and `/chat`
+  still answers with the shared model, its first `status` saying that saved keys cannot be
+  reached.
 
 **What to tell people.**
 
