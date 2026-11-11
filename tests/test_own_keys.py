@@ -252,6 +252,35 @@ async def test_a_key_that_fails_partway_ends_with_an_error_event_with_a_code(byo
     assert evs[-1]["code"] == "own_key_refused" and t.shared.requests == []
 
 
+async def test_a_provider_that_fails_in_its_stream_before_any_text_is_asked_again(byok):
+    # OpenRouter's failure after its 200: a code that is a string, and finish_reason "error".
+    error = {"code": "server_error", "message": "Upstream disconnected"}
+    choices = [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]
+    failed = f"data: {json.dumps({'error': error, 'choices': choices})}\n\n".encode()
+    t = byok(lambda body: stream_bytes(failed, DONE), say("Second."))
+    await save(t, "openrouter")
+    evs = events(await ask(t.app))
+    assert evs == [
+        {"type": "status", "message": OPENROUTER_STATUS},
+        {"type": "text", "delta": "Second."},
+        {"type": "done", "content": "Second."},
+    ]
+    assert len(t.own.requests) == 2
+
+    # Twice: their provider is down.
+    t = byok(lambda body: stream_bytes(failed, DONE))
+    await save(t, "openrouter")
+    evs = events(await ask(t.app))
+    assert evs[-1]["code"] == "own_provider_down" and "OpenRouter" in evs[-1]["message"] and len(t.own.requests) == 2
+
+    # After some text, never: the person is reading the answer.
+    t = byok(lambda body: stream_bytes(chunk({"content": "It is"}), failed, DONE), say("Second."))
+    await save(t, "openrouter")
+    evs = events(await ask(t.app))
+    assert evs[-1] == {"type": "error", "message": a.STALLED, "code": "own_provider_down"}
+    assert len(t.own.requests) == 1
+
+
 async def test_a_chosen_key_that_cannot_be_used_never_falls_back(byok):
     t = byok()
     await save(t, days=1)

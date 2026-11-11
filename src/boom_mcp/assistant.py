@@ -1945,8 +1945,12 @@ class Assistant:
                         status = p.status_of(p.error_of(chunk))
                         if model.provider and (p.classify(model.provider, chunk) or (status or 0) // 100 == 4):
                             raise own_refused(model, chunk, None, error_fields(chunk), bool(said))
-                        again = not said and not model.provider
-                        raise ModelError(STALLED, switchable=again, detail=error_fields(chunk))
+                        if model.provider and not said:
+                            # The provider failed after its 200, as OpenRouter says with
+                            # {"code": "server_error"} and finish_reason "error": asked
+                            # once more, as after a 5xx before any text.
+                            raise own_failure(p.DOWN, model.name, endpoint.model, error_fields(chunk), switchable=True)
+                        raise ModelError(STALLED, switchable=not said, detail=error_fields(chunk))
                     if isinstance(chunk.get("usage"), dict):
                         usage = chunk["usage"]  # in the last chunk, for the whole reply
                     for choice in (chunk.get("choices") or [])[:1]:
