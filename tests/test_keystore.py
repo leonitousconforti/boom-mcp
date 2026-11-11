@@ -66,6 +66,27 @@ def test_a_saved_key_opens_for_its_owner_and_shows_only_metadata(store, clock):
     ]
 
 
+def test_touch_and_mark_with_a_nonce_change_only_that_key(tmp_path, clock):
+    store = k.KeyStore(tmp_path / "keys.sqlite3", SECRET, clock=clock)
+    store.save("user-1", "anthropic", FAKE_KEY, "claude-haiku-5-5", 30)
+    old = store.key("user-1", "anthropic")
+    assert old.nonce and "nonce" not in repr(old)
+    # Saved anew while a question on the old key was running.
+    store.save("user-1", "anthropic", FAKE_KEY[:-4] + "Abcd", "claude-haiku-5-5", 30)
+    clock.now += 60
+    store.touch("user-1", "anthropic", nonce=old.nonce)
+    store.mark("user-1", "anthropic", k.REFUSED, nonce=old.nonce)
+    assert [(e["hint"], e["state"], e["last_used_at"]) for e in store.entries("user-1")] == [("…Abcd", "ok", None)]
+
+    # The nonce key() hands out is the row's, after it is sealed again under a new secret too.
+    rotated = k.KeyStore(store.path, NEW_SECRET, old_secrets=[SECRET], clock=clock)
+    new = rotated.key("user-1", "anthropic")
+    assert new.nonce != old.nonce
+    rotated.touch("user-1", "anthropic", nonce=new.nonce)
+    rotated.mark("user-1", "anthropic", k.REFUSED, nonce=new.nonce)
+    assert [(e["state"], e["last_used_at"]) for e in rotated.entries("user-1")] == [("refused", "2027-01-15T08:01:00Z")]
+
+
 def test_a_row_moved_to_another_person_or_provider_does_not_open(store):
     store.save("user-1", "anthropic", FAKE_KEY, "claude-haiku-5-5", 30)
     store.save("user-2", "anthropic", OTHER_KEY, "claude-haiku-5-5", 30)

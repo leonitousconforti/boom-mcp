@@ -340,6 +340,9 @@ class Model:
     provider: str = ""
     name: str = ""
     label: str = ""
+    # Which saved key this is (its row's nonce), so that a key saved while the
+    # question runs is not marked for what happened to this one.
+    key_row: bytes = field(default=b"", repr=False)
 
 
 # The prompt.
@@ -1541,7 +1544,8 @@ class Assistant:
     async def note_key(self, person: str, model: Model, what: str, *args):
         """Write down the use of a person's key; a store that fails does not stop the answer."""
         try:
-            await asyncio.to_thread(getattr(self.own.store, what), person, model.provider, *args)
+            store = self.own.store
+            await asyncio.to_thread(getattr(store, what), person, model.provider, *args, nonce=model.key_row or None)
         except sqlite3.Error as exc:
             log.error("could not note the use of a key: %s", type(exc).__name__)
 
@@ -1630,6 +1634,7 @@ class Assistant:
             provider=provider.id,
             name=provider.name,
             label=f"your {provider.name} key {saved.hint} ({saved.model})",
+            key_row=saved.nonce,
         )
 
     async def answer(self, messages, context, token, emit, model: Model | None = None) -> int:

@@ -17,6 +17,7 @@ from tests.test_assistant import OBJECT, chunk, events, say, stream, stream_byte
 pytestmark = pytest.mark.anyio
 
 LOGIN_TWO = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTIifQ.dHdvLXNpZ25hdHVyZQ"
+NEW_ANTHROPIC_KEY = "sk-ant-api03-FAKE" + "2" * 76 + "ne99"
 ANTHROPIC_STATUS = "Answering with your Anthropic key …ab12 (claude-haiku-5-5)"
 OPENROUTER_STATUS = "Answering with your OpenRouter key …cd34 (anthropic/claude-haiku-5.5)"
 DONE = b"data: [DONE]\n\n"
@@ -191,6 +192,33 @@ async def test_a_refused_key_is_not_tried_again_until_it_is_saved_again(byok):
     t.own.script = [say("Fixed.")]
     await save(t)
     assert events(await ask(t.app))[-1]["content"] == "Fixed."
+
+
+async def test_a_refusal_marks_only_the_key_it_was_for(byok):
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def revoked(body):
+        asked.set()
+        await release.wait()
+        return anthropic_error(401, "authentication_error", "invalid x-api-key")
+
+    t = byok(revoked)
+    t.checks.good.add(NEW_ANTHROPIC_KEY)
+    await save(t)
+    question = asyncio.create_task(ask(t.app))
+    await asyncio.wait_for(asked.wait(), 3)
+    # While a question runs on the key they just revoked, they save a new one on Profile.
+    body = {"key": NEW_ANTHROPIC_KEY, "model": "claude-haiku-5-5", "days": 7}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(t.app), base_url="http://boom") as client:
+        saved = await client.post("/assistant/keys/anthropic", json=body, headers={"Authorization": f"Bearer {LOGIN}"})
+    assert saved.status_code == 200 and saved.json()["hint"] == "…ne99"
+    release.set()
+    assert (await question).json()["code"] == "own_key_refused"
+    entry = (await asyncio.to_thread(t.store.entries, "user-1"))[0]
+    assert (entry["hint"], entry["state"]) == ("…ne99", "ok")
+    t.own.script = [say("With the new key.")]
+    assert events(await ask(t.app))[-1]["content"] == "With the new key."
+    assert t.own.requests[-1].headers["authorization"] == f"Bearer {NEW_ANTHROPIC_KEY}"
 
 
 async def test_one_failure_of_the_provider_is_asked_again(byok):

@@ -116,6 +116,8 @@ class Saved:
     workspace_id: str | None
     hint: str
     state: str
+    # The sealed row's nonce, new with every save: which key touch() and mark() are about.
+    nonce: bytes = field(default=b"", repr=False)
 
 
 class KeyStore:
@@ -251,14 +253,14 @@ class KeyStore:
             nonce, ciphertext, kid, shown, model, workspace, state = row
             key = self._open(user_id, provider, nonce, ciphertext, kid)
             if key is None:
-                return Saved(provider, "", model, workspace, shown, UNREADABLE)
+                return Saved(provider, "", model, workspace, shown, UNREADABLE, nonce)
             if kid != self.kid:
                 nonce, ciphertext, kid = self._seal(user_id, provider, key)
                 db.execute(
                     "UPDATE ai_keys SET nonce = ?, ciphertext = ?, kid = ? WHERE user_id = ? AND provider = ?",
                     (nonce, ciphertext, kid, user_id, provider),
                 )
-            return Saved(provider, key, model, workspace, shown, state if state in (OK, REFUSED) else OK)
+            return Saved(provider, key, model, workspace, shown, state if state in (OK, REFUSED) else OK, nonce)
 
     def use(self, user_id: str) -> str:
         """What the person chose to answer with: "shared", or a provider."""
@@ -279,17 +281,22 @@ class KeyStore:
         else:
             db.execute("INSERT OR REPLACE INTO ai_choice (user_id, use) VALUES (?, ?)", (user_id, use))
 
-    def touch(self, user_id: str, provider: str):
-        """Note that the key answered a question, so its owner can see when it was last used."""
-        with self._connect() as db:
-            db.execute(
-                "UPDATE ai_keys SET last_used_at = ? WHERE user_id = ? AND provider = ?",
-                (int(self.clock()), user_id, provider),
-            )
+    def touch(self, user_id: str, provider: str, nonce: bytes | None = None):
+        """Note that the key answered a question, so its owner can see when it was last used.
+        With nonce (Saved.nonce), only while that key is still the one saved, not one saved since."""
+        self._update(user_id, provider, nonce, "last_used_at", int(self.clock()))
 
-    def mark(self, user_id: str, provider: str, state: str):
+    def mark(self, user_id: str, provider: str, state: str, nonce: bytes | None = None):
+        """Set the key's state; with nonce, as touch()."""
+        self._update(user_id, provider, nonce, "state", state)
+
+    def _update(self, user_id: str, provider: str, nonce: bytes | None, column: str, value):
+        query, args = f"UPDATE ai_keys SET {column} = ? WHERE user_id = ? AND provider = ?", [value, user_id, provider]
+        if nonce is not None:
+            query += " AND nonce = ?"
+            args.append(nonce)
         with self._connect() as db:
-            db.execute("UPDATE ai_keys SET state = ? WHERE user_id = ? AND provider = ?", (state, user_id, provider))
+            db.execute(query, args)
 
     def delete(self, user_id: str, provider: str):
         """Forget the key; if it was the person's choice, they go back to the shared model."""
