@@ -107,8 +107,9 @@ boom-mcp --http --assistant
 
 This adds two routes next to `/mcp`, under `/assistant` (change it with `--assistant-prefix`):
 
-- `GET /assistant/health` returns `{"status": "ok", "model": "...", "vision": false}`. When the
-  assistant is off the route does not exist, and the web app hides its button.
+- `GET /assistant/health` returns `{"status": "ok", "model": "...", "vision": false, "own_keys": null}`.
+  When the assistant is off the route does not exist, and the web app hides its button.
+  `own_keys` describes [people's own keys](#peoples-own-model-keys) when they are on.
 - `POST /assistant/chat` takes `{"messages": [...], "context": {...}}` and an
   `Authorization: Bearer <Babamul token>` header. It answers with server-sent events, one
   `data: {...}` line each: `status`, `text`, `tool_call`, `tool_result` (with any images),
@@ -164,6 +165,96 @@ code (`401 type authentication_error`), a broken connection with the error's typ
 `boom-mcp` turns the `httpx` and `httpcore` loggers down to warnings: httpcore's debug lines
 quote a failed request's error whole, Authorization header included.
 
+### People's own model keys
+
+People can save their own Anthropic or OpenRouter API key on their Babamul profile, and their
+questions are then answered by that provider and billed to them. The shared model stays the
+default. This is off unless the operator sets `ASSISTANT_KEYS_DB` and a secret; until then the
+key routes answer 404 and `own_keys` in `/health` is `null`.
+
+Keys are kept in a small SQLite file, each sealed with AES-256-GCM under a secret only this
+server has, and bound to its owner and provider. No route ever returns a key: the web app sees
+the provider, the last 4 characters, the model, the dates and a state. A key is checked with the
+provider before it is kept (Anthropic's free token count with the chosen model, OpenRouter's
+`/key`), and kept for 1, 7, 30 or 90 days. Requests go only to `https://api.anthropic.com/v1`
+(its OpenAI-compatible endpoint) and `https://openrouter.ai/api/v1`; no route takes a URL.
+
+Only the web app's login tokens may save or use a key. A `bbml_` API token gets a 403 on the key
+routes, and on `/chat` always gets the shared model: API tokens end up in notebooks and
+repositories. Questions on a person's key have their own line and rate limit, so they never
+wait for the shared model, and they never fall back to it: a key that fails says why, with a
+code, and the web app offers to ask the shared model instead.
+
+**Setting it up.** Keep the database on local disk (not NFS), outside any read-only image, and
+run one process: the file and the limits belong to it. Make the secret without printing it:
+
+```bash
+mkdir -m 700 -p /srv/boom-mcp/keys
+(umask 077; head -c 32 /dev/urandom | base64 > /srv/boom-mcp/keys/secret)
+export ASSISTANT_KEYS_DB=/srv/boom-mcp/keys/keys.sqlite3
+export ASSISTANT_KEYS_SECRET_FILE=/srv/boom-mcp/keys/secret
+```
+
+Back the secret up somewhere safe. Without it every saved key is unreadable, and people have to
+save theirs again; nothing else holds a copy. To change it, move the old file to
+`ASSISTANT_KEYS_OLD_SECRET_FILE` and make a new one: keys sealed under the old secret are sealed
+again under the new one when next used, and after `ASSISTANT_KEYS_MAX_DAYS` the old file can go.
+Whoever runs or breaks into this server can read the keys in use: tell the people who save them.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `ASSISTANT_KEYS_DB` | unset | The SQLite file. Its directory is made 0700 and the file 0600 |
+| `ASSISTANT_KEYS_SECRET_FILE` | unset | A file only this user can read, holding 32 random bytes in base64 |
+| `ASSISTANT_KEYS_SECRET` | unset | The same secret as a variable, for a container. The file wins |
+| `ASSISTANT_KEYS_OLD_SECRET_FILE` | unset | A previous secret, while keys move to the new one |
+| `ASSISTANT_KEYS_MAX_DAYS` | `90` | The longest a key may be kept. People choose 1, 7, 30 or 90 days, up to this |
+| `ASSISTANT_BYOK_PROVIDERS` | `anthropic,openrouter` | The providers offered. `openai` and `gemini` are reserved for later |
+| `ASSISTANT_BYOK_ANTHROPIC_MODELS` | `claude-haiku-5-5,claude-sonnet-5-5` | Models people may pick for an Anthropic key. The first is the default |
+| `ASSISTANT_BYOK_OPENROUTER_MODELS` | `anthropic/claude-haiku-5.5,anthropic/claude-sonnet-5.5` | The same for OpenRouter. Add Gemini or GPT models only after a live test with several tool rounds |
+| `ASSISTANT_BYOK_CONCURRENCY` | `8` | Questions on people's keys answered at once |
+| `ASSISTANT_BYOK_MAX_QUEUE` | `16` | Questions on people's keys that may wait in line |
+| `ASSISTANT_BYOK_RATE_LIMIT` | `40` | Questions per person per window on their own key |
+| `ASSISTANT_BYOK_RATE_WINDOW` | `600` | The window, in seconds |
+| `ASSISTANT_BYOK_MAX_TOKENS` | `8192` | Longest reply. Claude's thinking counts toward it |
+| `ASSISTANT_BYOK_MAX_IMAGES` | `6` | Tool images an own model is shown at once, the newest; older ones are left out |
+
+A proxy in front that lists the paths it lets through needs the key routes too:
+
+- `GET /assistant/keys` returns `{"use": "shared", "keys": [{"provider", "hint", "model",
+  "workspace_id", "created_at", "expires_at", "last_used_at", "state"}]}`, `state` being `ok`,
+  `refused` or `unreadable`.
+- `POST /assistant/keys/{provider}` takes `{"key", "model", "days", "workspace_id", "use"}` and
+  returns the new entry. Errors are `{"error", "code"}`: 400 `bad_format`, `bad_model` or
+  `bad_days`, 422 `rejected`, 502 `provider_unreachable`, 429 `too_many_saves` (10 an hour), 403
+  `login_required`.
+- `POST /assistant/choice` takes `{"use": "shared" | provider, "model"}`; 409 `no_key` without a
+  working key.
+- `DELETE /assistant/keys/{provider}` and `DELETE /assistant/keys` answer 204. Removing the key
+  in use goes back to the shared model.
+- `POST /assistant/chat` also takes `"use": "shared"`, to ask the shared model once. A key that
+  fails before the answer starts gets a 422 with `own_key_missing`, `own_key_refused`,
+  `own_key_no_credit`, `own_key_busy` or `own_model_unavailable`, or a 503 with
+  `own_provider_down`; after, an `error` event with the same `code`. The first `status` says
+  which key answers ("Answering with your Anthropic key …ab12 (claude-haiku-5-5)"), and `done`
+  carries `usage` (`input_tokens`, `output_tokens`).
+
+**What to tell people.**
+
+- A Claude Pro or Max subscription, or ChatGPT Plus, is not an API key and cannot be used here.
+  Max, Ultra and Team plans include monthly API credits that can back an Anthropic Console key;
+  Pro does not.
+- Use a key with a spending limit: an Anthropic key in a workspace with a monthly spend limit, or
+  an OpenRouter key with a credit limit. For a school, keep it 7 days.
+- An Anthropic key not tied to one workspace needs its workspace id (`wrkspc_...`).
+- Babamul data looked up while answering, including data only they can see, goes to the provider
+  they chose. OpenRouter is asked to use only providers that do not keep it.
+
+**Later.** Anthropic goes through its OpenAI-compatible endpoint for now, which Anthropic does not
+call production-ready: it hides Claude's thinking (still billed) and has no prompt caching. A
+native Messages adapter would fix both. OpenRouter's "Connect" sign-in would spare people copying
+a key. OpenAI and Gemini keys need adapters of their own (OpenAI's Responses API for tool calls,
+Gemini's thought signatures); until then their models are reachable through OpenRouter.
+
 ### With Docker
 
 Put the settings in a file, say `assistant.env`:
@@ -186,6 +277,14 @@ curl http://localhost:8000/assistant/health
 
 Without `ASSISTANT_ENABLED` the image is a plain MCP server at `/mcp`.
 
+For people's own keys, give the container a volume at `/data` (the image makes it writable for
+the user it runs as) and the secret, and run one replica:
+
+```bash
+docker run -d --name boom-mcp -p 8000:8000 --env-file assistant.env -v boom-mcp-keys:/data \
+  -e ASSISTANT_KEYS_DB=/data/keys.sqlite3 -e ASSISTANT_KEYS_SECRET="$ASSISTANT_KEYS_SECRET" boom-mcp
+```
+
 ### With Apptainer
 
 Convert the Docker image, then run it. Apptainer shares the host's network, so the server
@@ -198,6 +297,9 @@ apptainer run --cleanenv --env-file assistant.env boom-mcp.sif
 
 If the image is in a registry, build from it instead:
 `apptainer build boom-mcp.sif docker://ghcr.io/OWNER/boom-mcp:latest`.
+
+The image is read-only, so for people's own keys bind a directory on local disk:
+`--bind /srv/boom-mcp/keys` with `ASSISTANT_KEYS_DB=/srv/boom-mcp/keys/keys.sqlite3`.
 
 ### Behind a reverse proxy
 
