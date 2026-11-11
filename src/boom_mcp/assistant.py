@@ -229,6 +229,22 @@ class Config:
         )
 
 
+@dataclass(frozen=True)
+class Model:
+    """What answers one question, and how it is asked.
+
+    endpoints are tried in turn; none means the operator's model, with its
+    fallback. The rest is what the tool loop needs to know about the model:
+    whether it can see images, and how much it may read and write.
+    """
+
+    endpoints: tuple[Endpoint, ...] = ()
+    vision: bool = False
+    thinking: bool = False
+    max_tokens: int = 1024
+    context_budget: int = 60_000
+
+
 # The prompt.
 
 SURVEYS = ("ZTF", "LSST")
@@ -903,8 +919,9 @@ class Assistant:
             return error(503, "Could not reach Babamul to check your login. Try again in a minute.")
         if person is None:
             return error(401, "Babamul did not accept your login. Log in again.")
+        model, line, limiter = self.shared_model(), self.line, self.limiter
 
-        if (wait := self.limiter.retry_after(person)) > 0:
+        if (wait := limiter.retry_after(person)) > 0:
             minutes = math.ceil(wait / 60)
             return error(
                 429,
@@ -924,14 +941,14 @@ class Assistant:
                 # one was asked all the same, so it still counts toward the limit.
                 return error(409, REPLACED)
             # Taken here, after the last await, so a burst cannot overfill the line.
-            if (place := self.line.join()) is None:
-                self.limiter.refund(person)
-                log.warning("turned user %s away: %d questions already waiting", person, len(self.line.waiting))
+            if (place := line.join()) is None:
+                limiter.refund(person)
+                log.warning("turned user %s away: %d questions already waiting", person, len(line.waiting))
                 return error(429, LINE_FULL, headers={"Retry-After": "60"})
 
             ticket = object()
             queue: asyncio.Queue = asyncio.Queue()
-            task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place))
+            task = asyncio.create_task(self.run(messages, context, token, person, queue.put_nowait, place, model, line))
 
             async def stop():
                 # The Failure ends the old stream even if its task never started.
@@ -940,7 +957,7 @@ class Assistant:
                 await asyncio.wait({task}, timeout=self.stop_grace)
                 if task.done():
                     # A task cancelled before it started never left the line itself.
-                    self.line.leave(place)
+                    line.leave(place)
 
             self.active[person] = (ticket, stop)
         finally:
@@ -950,7 +967,7 @@ class Assistant:
         def close():
             task.cancel()
             # Also here: a task cancelled before it starts never runs its own cleanup.
-            self.line.leave(place)
+            line.leave(place)
             if self.active.get(person, (None,))[0] is ticket:
                 del self.active[person]
 
@@ -967,7 +984,7 @@ class Assistant:
             if first.message != REPLACED:
                 # Our failure, not their choice: it does not count. A replaced one does,
                 # or asking again before each answer starts would never reach the limit.
-                self.limiter.refund(person)
+                limiter.refund(person)
             return error(first.status, first.message)
         return EventStream(self.frames(first, queue), close)
 
@@ -1058,16 +1075,16 @@ class Assistant:
 
     # Answering.
 
-    async def run(self, messages, context, token, person, emit, place: Place):
-        """Answer one question once it has its turn, every event and then None into emit."""
+    async def run(self, messages, context, token, person, emit, place: Place, model: Model, line: Line):
+        """Answer one question once it has its turn in line, every event and then None into emit."""
         started = time.monotonic()
         try:
-            if not await self.wait_turn(place, emit):
+            if not await self.wait_turn(place, emit, line):
                 log.warning("user %s gave up waiting in line after %.0f s", person, time.monotonic() - started)
                 emit(Failure(429, WAITED_TOO_LONG))
                 return
             waited = time.monotonic() - started
-            calls = await self.answer(messages, context, token, emit)
+            calls = await self.answer(messages, context, token, emit, model)
             log.info(
                 "answered user %s in %.1f s (%.1f s in line) with %d tool calls",
                 person,
@@ -1082,17 +1099,17 @@ class Assistant:
             log.exception("the assistant failed for user %s", person)
             emit(Failure(500, BROKEN))
         finally:
-            self.line.leave(place)
+            line.leave(place)
             emit(None)
 
-    async def wait_turn(self, place: Place, emit) -> bool:
+    async def wait_turn(self, place: Place, emit, line: Line) -> bool:
         """Wait for place to reach the model, telling the person where they are in
         line. False when that takes longer than the queue timeout."""
         give_up = time.monotonic() + self.config.queue_timeout
         while not place.admitted:
             if (left := give_up - time.monotonic()) <= 0:
                 return False
-            emit({"type": "status", "message": waiting_message(self.line.ahead(place))})
+            emit({"type": "status", "message": waiting_message(line.ahead(place))})
             place.moved.clear()
             try:
                 # Said again now and then, or the heartbeat's "Still working" replaces it.
@@ -1109,15 +1126,23 @@ class Assistant:
             self._tools = [openai_tool(t) for t in listed if t.annotations and t.annotations.read_only_hint]
         return self._tools
 
-    async def answer(self, messages, context, token, emit) -> int:
+    def shared_model(self) -> Model:
+        """The operator's model, which answers everyone who has not chosen their own."""
+        cfg = self.config
+        return Model(
+            vision=cfg.vision, thinking=cfg.thinking, max_tokens=cfg.max_tokens, context_budget=cfg.context_budget
+        )
+
+    async def answer(self, messages, context, token, emit, model: Model | None = None) -> int:
         """Run the tool loop for the last question in messages, emitting events.
 
         Returns the number of tool calls it made.
         """
+        model = model or self.shared_model()
         tools = await self.tools()
         offered = {t["function"]["name"] for t in tools}
         cfg = self.config
-        convo = [{"role": "system", "content": system_prompt(context, cfg.vision)}, *messages[-cfg.max_messages :]]
+        convo = [{"role": "system", "content": system_prompt(context, model.vision)}, *messages[-cfg.max_messages :]]
         # The question has its place on the model by now, so time spent in line
         # is not taken from its answer.
         start = time.monotonic()
@@ -1144,7 +1169,7 @@ class Assistant:
             calls_made = 0
             while calls_made < cfg.max_tool_calls and time.monotonic() < tools_until:
                 try:
-                    message = await self.round(convo, tools, tools_until, emit, talking_until=deadline)
+                    message = await self.round(model, convo, tools, tools_until, emit, talking_until=deadline)
                 except OutOfTime as exc:
                     if strip_tool_markup(exc.said):
                         # It was answering, and ran on to the deadline: keep what it said.
@@ -1168,17 +1193,17 @@ class Assistant:
                         content = "Not run: this question ran out of time for tools."
                     else:
                         calls_made += 1
-                        content, images = await self.call(call, offered, tools_until, emit)
+                        content, images = await self.call(call, offered, tools_until, emit, model)
                         seen += images
                     convo.append({"role": "tool", "tool_call_id": call["id"], "content": content})
-                if seen and cfg.vision:
+                if seen and model.vision:
                     convo.append(image_message(seen))
 
             # The cap or the clock stopped the tools: ask once more without them,
             # or the model asks for another instead of answering.
             convo.append({"role": "user", "content": ANSWER_NOW})
             try:
-                message = await self.round(convo, [], deadline, emit)
+                message = await self.round(model, convo, [], deadline, emit)
                 finish(message.get("content"), ending(message))
             except OutOfTime as exc:
                 finish(exc.said, CUT_SHORT, empty=OUT_OF_TIME)
@@ -1186,7 +1211,7 @@ class Assistant:
         finally:
             caller.reset(reset)
 
-    async def call(self, call, offered, until, emit) -> tuple[str, list[dict]]:
+    async def call(self, call, offered, until, emit, model: Model) -> tuple[str, list[dict]]:
         """Run one tool call; the text for the model and the images it returned."""
         name, call_id = call["function"]["name"], call["id"]
         try:
@@ -1229,7 +1254,7 @@ class Assistant:
             n = f"{len(images)} image{'s' * (len(images) > 1)}"
             note = (
                 f"[{n} shown to the person in the chat, and attached below for you.]"
-                if self.config.vision
+                if model.vision
                 else f"[{n} shown to the person in the chat. You cannot see {'them' if len(images) > 1 else 'it'}.]"
             )
             content = f"{note}\n{content}"
@@ -1252,8 +1277,11 @@ class Assistant:
         detail = f"{type(cause).__name__}: {cause}"[:200]
         return f"tool {name} crashed ({detail}). Calling it again with the same arguments will fail the same way."
 
-    def endpoints(self) -> list[Endpoint]:
+    def endpoints(self, model: Model | None = None) -> list[Endpoint]:
         """Where to send one round, in the order to try them."""
+        if model is not None and model.endpoints:
+            # Each is given a second chance, as the operator's model is without a fallback.
+            return [e for endpoint in model.endpoints for e in (endpoint, endpoint)]
         main, fallback = self.config.llm, self.config.fallback
         if fallback is None:
             return [main, main]
@@ -1261,7 +1289,7 @@ class Assistant:
             return [fallback, main]
         return [main, fallback]
 
-    async def round(self, messages, tools, until, emit, talking_until=None) -> dict:
+    async def round(self, model: Model, messages, tools, until, emit, talking_until=None) -> dict:
         """One model round, moved to the other endpoint if the first fails before saying anything.
 
         Raises OutOfTime when the clock reaches until, and ModelError when no
@@ -1269,10 +1297,10 @@ class Assistant:
         to talking_until: cutting it at until would throw away an answer the
         person is watching arrive, and ask for it again with less time.
         """
-        fit(messages, self.config.context_budget)
+        fit(messages, model.context_budget)
         failure: ModelError | None = None
         tried, again = None, True
-        for endpoint in self.endpoints():
+        for endpoint in self.endpoints(model):
             if endpoint is tried and not again:
                 break
             if (left := until - time.monotonic()) <= 0:
@@ -1287,7 +1315,7 @@ class Assistant:
                         def extend():
                             timer.reschedule(later)
 
-                    return await self.stream(endpoint, messages, tools, emit, said, extend)
+                    return await self.stream(model, endpoint, messages, tools, emit, said, extend)
             except TimeoutError:
                 raise OutOfTime("".join(said)) from None
             except Stalled as exc:
@@ -1308,13 +1336,16 @@ class Assistant:
                     raise ModelError(STALLED, detail=type(exc).__name__) from None
                 failure = ModelError(UNREACHABLE, switchable=True, detail=type(exc).__name__)
             log.warning("model at %s failed: %s", shown_url(endpoint.base_url), failure)
-            if endpoint is self.config.llm and self.config.fallback is not None:
+            if not model.endpoints and endpoint is self.config.llm and self.config.fallback is not None:
+                # Only the operator's own failures move everyone to the fallback.
                 self._main_skipped_until = time.monotonic() + self.config.fallback_period
         if failure is not None:
             raise failure
         raise OutOfTime()
 
-    async def stream(self, endpoint: Endpoint, messages, tools, emit, said: list[str], on_text=None) -> dict:
+    async def stream(
+        self, model: Model, endpoint: Endpoint, messages, tools, emit, said: list[str], on_text=None
+    ) -> dict:
         """One streamed chat completion, its text emitted as it arrives.
 
         on_text is called when the first text arrives. The message returned also
@@ -1322,7 +1353,7 @@ class Assistant:
         """
         cfg = self.config
         payload = {
-            **chat_payload(endpoint.model, messages, tools, cfg.thinking, cfg.max_tokens, endpoint.kind),
+            **chat_payload(endpoint.model, messages, tools, model.thinking, model.max_tokens, endpoint.kind),
             "stream": True,
         }
         headers = {"Accept": "text/event-stream", **dict(endpoint.headers)}
