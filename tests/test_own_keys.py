@@ -194,6 +194,35 @@ async def test_a_refused_key_is_not_tried_again_until_it_is_saved_again(byok):
     assert events(await ask(t.app))[-1]["content"] == "Fixed."
 
 
+def keeps_cookies(http: httpx.AsyncClient) -> bool:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    http.cookies.extract_cookies(httpx.Response(200, headers={"set-cookie": "s=FAKE; Path=/"}, request=request))
+    return bool(http.cookies)
+
+
+async def test_a_cookie_set_for_one_person_is_not_sent_for_another(byok):
+    def with_cookie(body):
+        headers = {"content-type": "text/event-stream", "set-cookie": "session=FAKE-COOKIE-OF-USER-1; Path=/; Secure"}
+        return httpx.Response(200, headers=headers, content=stream(say("Done.")))
+
+    t = byok(with_cookie)
+    t.babamul.tokens[LOGIN_TWO] = "user-2"
+    await save(t)
+    await asyncio.to_thread(t.store.save, "user-2", "anthropic", NEW_ANTHROPIC_KEY, "claude-haiku-5-5", 30)
+    for token in (LOGIN, LOGIN_TWO):
+        assert events(await ask(t.app, token=token))[-1]["content"] == "Done."
+    first, second = t.own.requests
+    assert second.headers["authorization"] == f"Bearer {NEW_ANTHROPIC_KEY}"
+    assert "cookie" not in first.headers and "cookie" not in second.headers
+
+    # The client the assistant makes for itself keeps none either; httpx's own would.
+    bot = a.Assistant(t.bot.config)
+    async with bot.running():
+        assert not keeps_cookies(bot.http)
+    async with httpx.AsyncClient() as plain:
+        assert keeps_cookies(plain)
+
+
 async def test_a_refusal_marks_only_the_key_it_was_for(byok):
     asked, release = asyncio.Event(), asyncio.Event()
 

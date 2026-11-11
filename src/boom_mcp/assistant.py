@@ -27,6 +27,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
+from http.cookiejar import DefaultCookiePolicy
 
 import anyio
 import httpx
@@ -1103,7 +1104,7 @@ class Assistant:
 
     def __init__(self, config: Config, *, http: httpx.AsyncClient | None = None, babamul_url: str | None = None):
         self.config = config
-        self.http = http
+        self.http = no_cookies(http) if http is not None else None
         self.babamul_url = (babamul_url or base_url_from_env()).rstrip("/")
         self.line = Line(config.concurrency, config.max_queue)
         self.limiter = RateLimiter(config.rate_limit, config.rate_window)
@@ -1132,7 +1133,7 @@ class Assistant:
                 yield
             else:
                 async with settings["http_client"]() as http:
-                    self.http = http
+                    self.http = no_cookies(http)
                     try:
                         yield
                     finally:
@@ -1982,6 +1983,13 @@ class Assistant:
         if model.provider:
             message["usage"] = usage
         return message
+
+
+def no_cookies(http: httpx.AsyncClient) -> httpx.AsyncClient:
+    """http, made to keep no cookies. It asks for everyone, with their own key or
+    token, so a cookie set in answer to one person must not go out with the next."""
+    http.cookies.jar.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    return http
 
 
 def bearer(request: Request) -> str:
