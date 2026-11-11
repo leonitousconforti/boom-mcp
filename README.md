@@ -136,7 +136,7 @@ gets a 429 at once.
 | `ASSISTANT_PREFIX` | `/assistant` | Same as `--assistant-prefix` |
 | `ASSISTANT_LLM_URL` | required | The model's base URL, ending in `/v1` |
 | `ASSISTANT_LLM_MODEL` | empty | The model name sent with each request |
-| `ASSISTANT_LLM_API_KEY` | empty | Sent to the model as a Bearer token, never to the browser |
+| `ASSISTANT_LLM_API_KEY` | empty | Sent to the model as a Bearer token, never to the browser. Printable ASCII with no spaces: anything else stops startup with an error that names the variable, not the key |
 | `ASSISTANT_LLM_VISION` | `false` | Also show the model the images the tools return |
 | `ASSISTANT_THINKING` | `false` | Let a reasoning model think before it answers |
 | `ASSISTANT_MAX_TOOL_CALLS` | `10` | Tool calls per question before it must answer |
@@ -153,9 +153,16 @@ gets a 429 at once.
 | `ASSISTANT_RATE_WINDOW` | `600` | The window, in seconds |
 | `ASSISTANT_FALLBACK_URL` | none | A second model, tried when the first is down, busy or failing. It is then used first for 5 minutes |
 | `ASSISTANT_FALLBACK_MODEL` | empty | Its model name |
-| `ASSISTANT_FALLBACK_API_KEY` | empty | Its key |
+| `ASSISTANT_FALLBACK_API_KEY` | empty | Its key, held to the same rule |
 | `BABAMUL_API_URL` | production | The Babamul API for the tools and the token check |
 | `BOOM_MCP_SHARED_ALERT_CACHE` | unset | `1` shares search_alerts' hour cache between users (Babamul's alert search does not depend on the user today); unset keys it by user |
+
+The logs never hold a key, a request body or a model server's error text, since a server can
+quote back what it was sent. A refused request is logged with its status and the error's type and
+code (`401 type authentication_error`), a broken connection with the error's type only
+(`LocalProtocolError`), and the model's URL without any user name, password or query.
+`boom-mcp` turns the `httpx` and `httpcore` loggers down to warnings: httpcore's debug lines
+quote a failed request's error whole, Authorization header included.
 
 ### With Docker
 

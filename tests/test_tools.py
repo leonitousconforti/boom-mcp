@@ -529,6 +529,20 @@ async def test_errors_reach_the_model(fake, monkeypatch):
     assert result.is_error and "rejected the API token" in result.content[0].text
 
 
+async def test_a_transport_error_reaches_the_model_without_the_token():
+    # What h11 raises for a header it refuses: the whole header, token and all.
+    token = "bbml_FAKE_not_a_real_token"
+
+    def refuse(request):
+        raise httpx.LocalProtocolError(f"Illegal header value b'Bearer {token}\\n'")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http:
+        with pytest.raises(babamul.BabamulError) as failed:
+            await babamul.Babamul(http, token, "https://babamul.invalid").get("/profile")
+    assert str(failed.value) == "Could not reach Babamul at https://babamul.invalid (LocalProtocolError)."
+    assert failed.value.__cause__ is None and failed.value.__suppress_context__
+
+
 def test_lsst_flux_conversion():
     rows = s.light_curve_rows(OBJECT, "ZTF", other_survey=True)
     lsst = next(r for r in rows if r["band"] == "lsstg")
