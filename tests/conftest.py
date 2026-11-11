@@ -219,10 +219,11 @@ def byok(fake, tmp_path):
     def build(*script, shared=None, config=None, env=None, **own_settings):
         own_model = FakeModel(*(script or [say("From your own key.")]))
         shared_model = FakeModel(*(shared or [say("From the shared model.")]))
-        checks, hosts = FakeProviders(), []
+        checks, hosts, urls = FakeProviders(), [], []
 
         async def route(request):
             hosts.append(request.url.host)
+            urls.append(str(request.url))
             if request.url.host == "llm.test":
                 return await shared_model(request)
             if request.url.host in ("api.anthropic.com", "openrouter.ai"):
@@ -237,7 +238,7 @@ def byok(fake, tmp_path):
         bot = a.Assistant(cfg, http=httpx.AsyncClient(transport=httpx.MockTransport(route)))
         return SimpleNamespace(
             bot=bot, app=a.mount(Starlette(), bot), store=store, own=own_model, shared=shared_model,
-            checks=checks, babamul=fake, hosts=hosts,
+            checks=checks, babamul=fake, hosts=hosts, urls=urls,
         )
 
     return build
