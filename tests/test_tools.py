@@ -3,6 +3,7 @@ import math
 import threading
 import time
 from contextlib import asynccontextmanager
+from typing import get_args
 
 import anyio
 import httpx
@@ -13,6 +14,7 @@ from boom_mcp import babamul, plots, tools
 from boom_mcp.assistant import TOOL_SHARE, Config
 from boom_mcp import summarize as s
 from boom_mcp.app import caller, mcp, settings
+from boom_mcp.surveys import SURVEY_NOTES
 
 from . import conftest
 from .conftest import JD0, OBJECT, alert
@@ -612,3 +614,7 @@ def test_applecider_history_tells_missing_from_abstained():
     }
     out = summarize.object_summary(obj, "ZTF")
     assert out["applecider_history"] == ["no AppleCiDEr result x1", "abstained x1", "SN Ia x1"]
+
+
+def test_every_survey_has_notes():
+    assert set(SURVEY_NOTES) == set(get_args(tools.Survey))
