@@ -49,3 +49,5 @@ python hunt/make_rubinml.py hunt/out   # needs fastavro, astropy, numpy; fetches
 ```
 
 `out/truth.json` is the answer key; keep it away from participants.
+`ANSWER-SHEET.md` is the grading sheet from the 2026-11-10 session. Questions 6 and 7 and the
+real objects it names depend on that week's alerts, so re-check them against new data.

@@ -5,5 +5,3 @@ __pycache__/
 .pytest_cache/
 # Machine-specific client config.
 .mcp.json
-# The school hunt holds the answer key; it is published after the session.
-hunt/
