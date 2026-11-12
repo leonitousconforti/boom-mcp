@@ -40,7 +40,7 @@ async def main():
 
         _, t = await call("trail 1", "convert_time", value="61353.30")
         jd = t["jd"]
-        _, found = await call("trail 2", "search_alerts", start=str(jd - 1 / 1440), end=str(jd + 1 / 1440), max_mag=14.0, positive_only=False)
+        _, found = await call("trail 2", "search_alerts", start=str(jd - 1 / 1440), end=str(jd + 1 / 1440), max_mag=14.0, positive_only=False, exclude_solar_system=True)
         signpost = found["alerts"][0]
         await call("trail 3", "get_object", object_id=signpost["object_id"])
         await call("trail 4", "get_cutouts", object_id=signpost["object_id"])
