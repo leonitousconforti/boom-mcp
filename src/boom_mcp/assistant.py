@@ -98,6 +98,17 @@ TOKEN_CACHE = 4096
 # A Bearer token as RFC 6750 spells it. Babamul's API and login tokens both fit; anything
 # else Babamul would refuse, and a byte outside ASCII would crash the request to it.
 TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}=*")
+# A model API key: printable ASCII with no spaces. Anything else in an Authorization
+# header makes h11 raise an error that quotes the whole header, key and all, and
+# that error would reach the logs.
+API_KEY = re.compile(r"[!-~]{1,4096}")
+# Extra headers an endpoint sends: a header name, and a value of printable ASCII.
+HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
+HEADER_VALUE = re.compile(r"[!-~](?:[ -~]{0,1022}[!-~])?")
+# Headers stream() sets itself, which an endpoint's extra headers may not replace.
+OWN_HEADERS = frozenset({"accept", "authorization", "content-length", "content-type", "host"})
+# How an endpoint wants its requests, see chat_payload().
+KINDS = ("llamacpp", "openai")
 MAX_BODY = 1_000_000
 MAX_MESSAGE_CHARS = 20_000
 
@@ -106,13 +117,45 @@ def env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def check_key(key: str, what: str) -> str:
+    """key, if it can go in an Authorization header. The error names what the key
+    is for and never the key itself."""
+    if key and not API_KEY.fullmatch(key):
+        raise ValueError(f"{what} has spaces, line breaks or characters outside ASCII, so it cannot be sent")
+    return key
+
+
+def shown_url(url: str) -> str:
+    """url for a log line: without a user name, password or query, which can hold a key."""
+    try:
+        return str(httpx.URL(url).copy_with(userinfo=b"", query=None, fragment=None))
+    except (httpx.InvalidURL, TypeError, ValueError):
+        return "(a URL that does not parse)"
+
+
 @dataclass(frozen=True)
 class Endpoint:
-    """An OpenAI-compatible server: base_url ends in /v1."""
+    """An OpenAI-compatible server: base_url ends in /v1.
+
+    kind is what the request body may hold (see chat_payload): "llamacpp", the
+    operator's own server, or "openai", a hosted provider. headers are extra
+    (name, value) pairs for every request, such as a provider's workspace id.
+    """
 
     base_url: str
     model: str = ""
     api_key: str = field(default="", repr=False)
+    kind: str = "llamacpp"
+    headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+    def __post_init__(self):
+        if self.kind not in KINDS:
+            raise ValueError(f"an endpoint's kind is one of {', '.join(KINDS)}, not {self.kind!r}")
+        check_key(self.api_key, f"the API key for {shown_url(self.base_url)}")
+        for name, value in self.headers:
+            # Checked here so that a bad one never reaches h11, whose error would quote it.
+            if not HEADER_NAME.fullmatch(name) or name.lower() in OWN_HEADERS or not HEADER_VALUE.fullmatch(value):
+                raise ValueError(f"the extra header {name!r} for {shown_url(self.base_url)} cannot be sent")
 
 
 @dataclass
@@ -159,11 +202,15 @@ class Config:
             # name or the Authorization header.
             return env.get(name, "").strip()
 
+        def key(name):
+            # Refused at startup, by name, rather than failing on every question.
+            return check_key(text(name), name)
+
         fallback = None
         if fallback_url := text("ASSISTANT_FALLBACK_URL"):
-            fallback = Endpoint(fallback_url, text("ASSISTANT_FALLBACK_MODEL"), text("ASSISTANT_FALLBACK_API_KEY"))
+            fallback = Endpoint(fallback_url, text("ASSISTANT_FALLBACK_MODEL"), key("ASSISTANT_FALLBACK_API_KEY"))
         return cls(
-            llm=Endpoint(url, text("ASSISTANT_LLM_MODEL"), text("ASSISTANT_LLM_API_KEY")),
+            llm=Endpoint(url, text("ASSISTANT_LLM_MODEL"), key("ASSISTANT_LLM_API_KEY")),
             fallback=fallback,
             vision=env_flag(env.get("ASSISTANT_LLM_VISION")),
             thinking=env_flag(env.get("ASSISTANT_THINKING")),
@@ -399,8 +446,8 @@ def strip_tool_markup(text: str | None) -> str:
     return TOOL_MARKUP.sub("", text or "").strip()
 
 
-def chat_payload(model, messages, tools, thinking=False, max_tokens=0) -> dict:
-    """The body of a chat-completions request.
+def chat_payload(model, messages, tools, thinking=False, max_tokens=0, kind="llamacpp") -> dict:
+    """The body of a streamed chat-completions request, for an endpoint of this kind.
 
     `tools` is omitted when empty rather than sent as []: the last round asks
     for an answer with no tools left to call, and a server that rejects an
@@ -410,7 +457,21 @@ def chat_payload(model, messages, tools, thinking=False, max_tokens=0) -> dict:
     loop, and the stall timeout never fires while it keeps talking. There is no
     repetition penalty, because it would also stop the model from writing an
     object id exactly as a tool gave it.
+
+    A hosted provider ("openai") gets only standard fields: chat_template_kwargs
+    is llama.cpp's own, and Anthropic refuses a temperature below 1 on its newer
+    models, so the provider's sampling defaults stay. tool_choice is never sent,
+    since Anthropic refuses a forced one. stream_options asks for the tokens used
+    in the last chunk, since on a provider someone pays for them.
     """
+    if kind == "openai":
+        payload = {"model": model, "messages": messages}
+        if max_tokens > 0:
+            payload["max_tokens"] = max_tokens
+        if tools:
+            payload["tools"] = tools
+        payload["stream_options"] = {"include_usage": True}
+        return payload
     payload = {"model": model, "messages": messages, "temperature": 0}
     if max_tokens > 0:
         payload["max_tokens"] = max_tokens
@@ -421,24 +482,81 @@ def chat_payload(model, messages, tools, thinking=False, max_tokens=0) -> dict:
     return payload
 
 
+# The fields of a streamed tool call that merge_deltas puts together itself.
+CALL_FIELDS = frozenset({"index", "id", "type", "function"})
+# The streamed reasoning fragments that join the block before them, and the field that grows.
+REASONING_TEXT = {"reasoning.text": "text", "reasoning.summary": "summary"}
+
+
 def merge_deltas(deltas) -> dict:
-    """The message the deltas of a streamed chat completion add up to."""
-    content, calls = [], {}
+    """The message the deltas of a streamed chat completion add up to.
+
+    Tool calls are put together by index. A part with no index is a call of
+    its own: Gemini sends each call whole and without one, and adding it to
+    call 0 would make one broken call of several.
+
+    Some fields go back to the provider on the next round, as it sent them:
+    any other field of a tool call (Gemini's extra_content, which holds its
+    thought signature) and the message's reasoning_details (OpenRouter's
+    reasoning blocks). A model that loses them may refuse the next round.
+    Other message fields are dropped, llama.cpp's reasoning_content among
+    them: some servers refuse it in a request.
+    """
+    content, indexed, loose, reasoning = [], {}, [], []
     for delta in deltas:
         content.append(delta.get("content") or "")
         for part in delta.get("tool_calls") or []:
-            call = calls.setdefault(
-                part.get("index", 0),
-                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-            )
+            if part.get("index") is None:
+                call = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                loose.append(call)
+            else:
+                call = indexed.setdefault(
+                    part["index"],
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
             function = part.get("function") or {}
             call["id"] = part.get("id") or call["id"]
             call["function"]["name"] = function.get("name") or call["function"]["name"]
             call["function"]["arguments"] += function.get("arguments") or ""
+            for name, value in part.items():
+                if name not in CALL_FIELDS and value is not None:
+                    call[name] = merged(call.get(name), value)
+        for detail in delta.get("reasoning_details") or []:
+            add_reasoning(reasoning, detail)
     message = {"role": "assistant", "content": "".join(content) or None}
-    if calls:
-        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    if calls := [indexed[index] for index in sorted(indexed)] + loose:
+        message["tool_calls"] = calls
+    if reasoning:
+        message["reasoning_details"] = reasoning
     return message
+
+
+def merged(old, new):
+    """A field sent again in a later delta: objects are merged, anything else replaced."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return {**old, **{name: merged(old.get(name), value) for name, value in new.items()}}
+    return new
+
+
+def add_reasoning(details: list[dict], part) -> None:
+    """Add one streamed reasoning_details fragment, the way OpenRouter's own client does.
+
+    A block arrives in many small fragments, and the provider wants back the
+    blocks it made, in order and unchanged. A text or summary fragment joins
+    the block before it if that is of the same type, until a signature closes a
+    text block. Encrypted blocks, and types not known here, are kept as they came.
+    """
+    if not isinstance(part, dict):
+        return
+    grows = REASONING_TEXT.get(part.get("type"))
+    last = details[-1] if details else None
+    if grows and last is not None and last.get("type") == part["type"] and not last.get("signature"):
+        last[grows] = (last.get(grows) or "") + (part.get(grows) or "")
+        for name, value in part.items():
+            if name != grows and value is not None and last.get(name) is None:
+                last[name] = value
+        return
+    details.append(dict(part))
 
 
 def fit(messages: list[dict], budget: int) -> list[dict]:
@@ -568,6 +686,36 @@ class Failure:
 
     status: int
     message: str
+
+
+# An error type or code worth logging: a short word, never a sentence.
+ERROR_LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def error_fields(body) -> str:
+    """The type and code of a model server's error, from its body, for the logs.
+
+    Never its message or anything else in it: a provider may quote the request
+    back, the key it refused included. body is the raw bytes or text of an
+    error, or a parsed one; a body that is not JSON gives nothing.
+    """
+    if isinstance(body, (bytes, str)):
+        try:
+            body = json.loads(body)
+        except (ValueError, RecursionError):
+            body = None
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    if not isinstance(body, dict):
+        return "no error type"
+    fields = []
+    for name in ("type", "code"):
+        value = body.get(name)
+        if (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, str) and ERROR_LABEL.fullmatch(value)
+        ):
+            fields.append(f"{name} {value}")
+    return ", ".join(fields) or "no error type"
 
 
 def refused(status: int, detail: str) -> ModelError:
@@ -878,7 +1026,8 @@ class Assistant:
                 timeout=15,
             )
         except httpx.HTTPError as exc:
-            raise BabamulDown(str(exc)) from exc
+            # The type only: an httpx error can quote the Authorization header.
+            raise BabamulDown(type(exc).__name__) from None
         if response.status_code in (401, 403):
             person, ttl = None, BAD_TOKEN_TTL
         elif response.status_code >= 400:
@@ -1152,11 +1301,13 @@ class Assistant:
                     raise
                 failure = exc
             except httpx.TransportError as exc:
-                # Unreachable, or the connection broke.
+                # Unreachable, or the connection broke. Only the type is kept, and the
+                # error is not chained: h11's message for a header it refuses quotes
+                # the whole header, so it can hold the key.
                 if said:
-                    raise ModelError(STALLED, detail=repr(exc)) from exc
-                failure = ModelError(UNREACHABLE, switchable=True, detail=repr(exc))
-            log.warning("model at %s failed: %s", endpoint.base_url, failure)
+                    raise ModelError(STALLED, detail=type(exc).__name__) from None
+                failure = ModelError(UNREACHABLE, switchable=True, detail=type(exc).__name__)
+            log.warning("model at %s failed: %s", shown_url(endpoint.base_url), failure)
             if endpoint is self.config.llm and self.config.fallback is not None:
                 self._main_skipped_until = time.monotonic() + self.config.fallback_period
         if failure is not None:
@@ -1170,9 +1321,15 @@ class Assistant:
         has the reply's finish_reason, which the caller takes out.
         """
         cfg = self.config
-        payload = {**chat_payload(endpoint.model, messages, tools, cfg.thinking, cfg.max_tokens), "stream": True}
-        headers = {"Accept": "text/event-stream"}
+        payload = {
+            **chat_payload(endpoint.model, messages, tools, cfg.thinking, cfg.max_tokens, endpoint.kind),
+            "stream": True,
+        }
+        headers = {"Accept": "text/event-stream", **dict(endpoint.headers)}
         if endpoint.api_key:
+            # Checked again here, so a key that cannot be sent never reaches h11.
+            if not API_KEY.fullmatch(endpoint.api_key):
+                raise ModelError(MISCONFIGURED, detail="the API key cannot go in a header")
             headers["Authorization"] = f"Bearer {endpoint.api_key}"
         stall = cfg.stall_timeout
         async with self.http.stream(
@@ -1188,23 +1345,25 @@ class Assistant:
             if response.status_code >= 400:
                 # The status alone says nothing: a refused request looks the same
                 # whether the context was too long or a tool schema was rejected.
-                detail = (await response.aread())[:600].decode(errors="replace")
+                # The error's type and code tell them apart; the rest of the body
+                # is not logged, since a provider may quote the key it refused.
+                why = error_fields(await response.aread())
                 log.warning(
                     "model at %s refused the request: %s %s (messages=%d, tools=%d, %d chars)",
-                    endpoint.base_url,
+                    shown_url(endpoint.base_url),
                     response.status_code,
-                    detail,
+                    why,
                     len(messages),
                     len(tools),
                     len(json.dumps(messages)) + len(json.dumps(tools)),
                 )
-                raise refused(response.status_code, f"{response.status_code} {detail}")
+                raise refused(response.status_code, f"{response.status_code} {why}")
             kind = response.headers.get("content-type", "")
             if not kind.startswith("text/event-stream"):
-                # A proxy's login or error page, sent with a 200.
-                detail = (await response.aread())[:300].decode(errors="replace")
-                log.warning("model at %s answered %r, not a stream: %s", endpoint.base_url, kind, detail)
-                raise ModelError(UNREACHABLE, switchable=True, detail=f"content-type {kind!r}")
+                # A proxy's login or error page, sent with a 200. Its body is not
+                # logged: it is not ours to keep, and the type says enough.
+                log.warning("model at %s answered %r, not a stream", shown_url(endpoint.base_url), kind[:100])
+                raise ModelError(UNREACHABLE, switchable=True, detail=f"content-type {kind[:100]!r}")
             emit({"type": "_started"})
             deltas, finish, ended, started = [], None, False, False
             async with aclosing(response.aiter_lines()) as lines:
@@ -1222,7 +1381,7 @@ class Assistant:
                     started = True
                     if line.startswith("error:"):
                         # How llama.cpp reports a failure partway through a reply.
-                        raise ModelError(STALLED, switchable=not said, detail=line[6:].strip()[:300])
+                        raise ModelError(STALLED, switchable=not said, detail=error_fields(line[6:].strip()))
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -1234,7 +1393,7 @@ class Assistant:
                     except ValueError:
                         continue
                     if chunk.get("error"):
-                        raise ModelError(STALLED, switchable=not said, detail=str(chunk["error"])[:300])
+                        raise ModelError(STALLED, switchable=not said, detail=error_fields(chunk))
                     for choice in (chunk.get("choices") or [])[:1]:
                         finish = choice.get("finish_reason") or finish
                         delta = choice.get("delta") or {}
@@ -1246,10 +1405,14 @@ class Assistant:
                             emit({"type": "text", "delta": text})
         if not ended and finish is None:
             # A reply that just stops was cut off on the way, whatever its status said.
-            log.warning("model at %s stopped its reply without finishing it (%d chunks)", endpoint.base_url, len(deltas))
+            log.warning(
+                "model at %s stopped its reply without finishing it (%d chunks)",
+                shown_url(endpoint.base_url),
+                len(deltas),
+            )
             raise ModelError(STALLED, switchable=not said, detail="the reply ended early")
         if not deltas:
-            log.warning("model at %s sent an empty reply", endpoint.base_url)
+            log.warning("model at %s sent an empty reply", shown_url(endpoint.base_url))
         message = merge_deltas(deltas)
         message["finish_reason"] = finish
         return message

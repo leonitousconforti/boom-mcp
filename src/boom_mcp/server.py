@@ -92,6 +92,11 @@ def http_app(args):
     return app
 
 
+def quiet_http_logs():
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--http", action="store_true", help="Serve Streamable HTTP instead of stdio.")
@@ -135,6 +140,11 @@ def main():
     parser.add_argument("--plugin", action="append", default=[], help="A Python file of extra @tool() functions.")
     parser.add_argument("--no-examples", action="store_true", help="Skip the bundled example plugins.")
     args = parser.parse_args()
+
+    # httpx logs every request at INFO, and httpcore each step of it at DEBUG with
+    # any error quoted whole: for a header h11 refuses, that is the key in it. The
+    # assistant's own lines say what matters without them.
+    quiet_http_logs()
 
     for candidate in ENV_FILES:
         if Path(candidate).exists():

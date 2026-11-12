@@ -139,7 +139,9 @@ class Babamul:
                         "(shorter time window, magnitude or reliability cuts) and retry."
                     ) from e
             except httpx.RequestError as e:
-                raise BabamulError(f"Could not reach Babamul at {self.base_url}: {e}") from e
+                # The type only: an httpx error can quote the Authorization header,
+                # and this message goes to the model and the logs.
+                raise BabamulError(f"Could not reach Babamul at {self.base_url} ({type(e).__name__}).") from None
             else:
                 if response.status_code not in RETRY_STATUSES:
                     break

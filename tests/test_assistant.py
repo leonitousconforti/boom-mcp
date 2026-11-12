@@ -6,8 +6,10 @@ import base64
 import inspect
 import json
 import logging
+import re
 import sys
 import time
+import traceback
 from types import SimpleNamespace
 
 import httpx
@@ -16,6 +18,7 @@ from starlette.applications import Starlette
 
 from boom_mcp import assistant as a
 from boom_mcp import plugins, server
+from boom_mcp import summarize as s
 from boom_mcp.app import caller, mcp, settings
 from boom_mcp.server import host_warning, http_app
 
@@ -54,7 +57,7 @@ class FakeModel:
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        self.requests.append(SimpleNamespace(body=body, headers=request.headers))
+        self.requests.append(SimpleNamespace(body=body, headers=request.headers, content=request.content))
         step = self.script.pop(0) if len(self.script) > 1 else self.script[0]
         if callable(step):
             step = step(body)
@@ -685,6 +688,88 @@ def test_merge_deltas():
     assert a.merge_deltas([{"content": ""}]) == {"role": "assistant", "content": None}
 
 
+def test_merge_deltas_keeps_what_a_provider_wants_back():
+    # Gemini through an OpenAI-compatible API: each call whole, with no index, and
+    # its thought signature in extra_content.
+    gemini = [
+        {"tool_calls": [{"id": "g1", "type": "function", "function": {"name": "get_object", "arguments": "{}"},
+                         "extra_content": {"google": {"thought_signature": "SIG1"}}}]},
+        {"tool_calls": [{"id": "g2", "type": "function", "function": {"name": "get_cutouts", "arguments": "{}"},
+                         "extra_content": {"google": {"thought_signature": "SIG2"}}}]},
+    ]
+    calls = a.merge_deltas(gemini)["tool_calls"]
+    assert [(c["id"], c["function"]["name"]) for c in calls] == [("g1", "get_object"), ("g2", "get_cutouts")]
+    assert [c["extra_content"]["google"]["thought_signature"] for c in calls] == ["SIG1", "SIG2"]
+
+    # An extra field sent again in a later delta of the same call adds to it.
+    split = [
+        {"tool_calls": [{"index": 0, "id": "c", "function": {"name": "x", "arguments": "{"}, "extra_content": {"a": {"b": 1}}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": "}"}, "extra_content": {"a": {"c": 2}}, "other": None}]},
+    ]
+    assert a.merge_deltas(split)["tool_calls"] == [
+        {"id": "c", "type": "function", "function": {"name": "x", "arguments": "{}"}, "extra_content": {"a": {"b": 1, "c": 2}}}
+    ]
+
+    # OpenRouter's reasoning blocks, streamed in fragments: text joins the block
+    # before it until a signature closes it, and encrypted blocks stay whole.
+    reasoning = [
+        {"role": "assistant", "reasoning": "Let ",
+         "reasoning_details": [{"type": "reasoning.text", "text": "Let ", "format": "anthropic-claude-v1", "index": 0}]},
+        {"reasoning": "me think.", "reasoning_details": [{"type": "reasoning.text", "text": "me think.", "index": 0}]},
+        {"reasoning_details": [{"type": "reasoning.text", "text": "", "signature": "SIG", "index": 0}]},
+        {"reasoning_details": [{"type": "reasoning.text", "text": "Again.", "index": 1}]},
+        {"reasoning_details": [{"type": "reasoning.encrypted", "data": "ENC1", "index": 2}]},
+        {"reasoning_details": [{"type": "reasoning.encrypted", "data": "ENC2", "index": 3}, "not a block"]},
+        {"reasoning_details": [{"type": "reasoning.summary", "summary": "Sum", "index": 4}]},
+        {"reasoning_details": [{"type": "reasoning.summary", "summary": "med up.", "index": 4}]},
+        {"content": "Done."},
+    ]
+    message = a.merge_deltas(reasoning)
+    assert message == {
+        "role": "assistant",
+        "content": "Done.",
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": "Let me think.", "format": "anthropic-claude-v1", "index": 0, "signature": "SIG"},
+            {"type": "reasoning.text", "text": "Again.", "index": 1},
+            {"type": "reasoning.encrypted", "data": "ENC1", "index": 2},
+            {"type": "reasoning.encrypted", "data": "ENC2", "index": 3},
+            {"type": "reasoning.summary", "summary": "Summed up.", "index": 4},
+        ],
+    }
+    assert reasoning[0]["reasoning_details"][0]["text"] == "Let "  # the deltas are left as they came
+
+    # llama.cpp's reasoning_content is not sent back, as before.
+    assert a.merge_deltas([{"reasoning_content": "Hmm."}, {"content": "Hi."}]) == {"role": "assistant", "content": "Hi."}
+
+
+TOOL = {"type": "function", "function": {"name": "convert_time", "description": "Convert a time",
+                                         "parameters": {"type": "object", "properties": {"value": {"type": "string"}}}}}
+
+
+def test_the_llamacpp_body_is_unchanged():
+    messages = [{"role": "user", "content": "hi"}]
+    for thinking, tools, max_tokens, fields in (
+        (False, [], 0, ["model", "messages", "temperature", "chat_template_kwargs"]),
+        (False, [TOOL], 1024, ["model", "messages", "temperature", "max_tokens", "tools", "chat_template_kwargs"]),
+        (True, [], 1024, ["model", "messages", "temperature", "max_tokens"]),
+        (True, [TOOL], 0, ["model", "messages", "temperature", "tools"]),
+    ):
+        payload = a.chat_payload("m", messages, tools, thinking, max_tokens)
+        assert payload == a.chat_payload("m", messages, tools, thinking, max_tokens, "llamacpp")
+        assert list(payload) == fields  # in this order, so the request's bytes are the same too
+        assert payload["temperature"] == 0 and payload.get("max_tokens", 0) == max_tokens
+        assert payload.get("chat_template_kwargs", {"enable_thinking": False}) == {"enable_thinking": False}
+
+
+def test_a_provider_body_has_only_standard_fields():
+    messages = [{"role": "user", "content": "hi"}]
+    for thinking in (False, True):
+        payload = a.chat_payload("claude-haiku-5-5", messages, [TOOL], thinking, 8192, "openai")
+        assert list(payload) == ["model", "messages", "max_tokens", "tools", "stream_options"]
+        assert payload["max_tokens"] == 8192 and payload["stream_options"] == {"include_usage": True}
+    assert list(a.chat_payload("m", messages, [], max_tokens=0, kind="openai")) == ["model", "messages", "stream_options"]
+
+
 def test_chat_payload_and_fit():
     assert "tools" not in a.chat_payload("m", [], [])
     assert "chat_template_kwargs" not in a.chat_payload("m", [], [{"x": 1}], thinking=True)
@@ -1115,6 +1200,233 @@ async def test_the_token_cache_stays_small(make, monkeypatch):
     assert await t.bot.person("bbml_test") == "user-1"
 
 
+# The request a model server gets.
+
+# A round as llama.cpp streams it (recorded from Qwen3.8 27B on llama.cpp), with
+# reasoning_content as it comes when the model thinks.
+LLAMACPP_ROUND = [
+    {"role": "assistant", "content": None},
+    {"reasoning_content": "The person wants the time."},
+    {"content": "Let me check. "},
+    {"tool_calls": [{"index": 0, "id": "YY9W94ZtPLhdlX6O", "type": "function",
+                     "function": {"name": "convert_time", "arguments": "{"}}]},
+    {"tool_calls": [{"index": 0, "function": {"arguments": '"value":"'}}]},
+    {"tool_calls": [{"index": 0, "function": {"arguments": '2461350.5"}'}}]},
+    {"tool_calls": [{"index": 1, "id": "Ue6nFPFaAjhwLBPR", "type": "function",
+                     "function": {"name": "no_such_tool", "arguments": "{"}}]},
+    {"tool_calls": [{"index": 1, "function": {"arguments": "}"}}]},
+]
+# What the assistant sent for it before endpoints had a kind, byte for byte.
+LLAMACPP_TOOLS = (
+    b'"tools":[{"type":"function","function":{"name":"convert_time","description":"Convert a time",'
+    b'"parameters":{"type":"object","properties":{"value":{"type":"string"}}}}}],'
+    b'"chat_template_kwargs":{"enable_thinking":false},"stream":true}'
+)
+LLAMACPP_BODIES = (
+    b'{"model":"test-model","messages":[{"role":"system","content":"SYSTEM"},{"role":"user","content":"What time is it?"}],'
+    b'"temperature":0,"max_tokens":1024,' + LLAMACPP_TOOLS,
+    b'{"model":"test-model","messages":[{"role":"system","content":"SYSTEM"},{"role":"user","content":"What time is it?"},'
+    b'{"role":"assistant","content":"Let me check. ","tool_calls":[{"id":"YY9W94ZtPLhdlX6O","type":"function",'
+    b'"function":{"name":"convert_time","arguments":"{\\"value\\":\\"2461350.5\\"}"}},{"id":"Ue6nFPFaAjhwLBPR",'
+    b'"type":"function","function":{"name":"no_such_tool","arguments":"{}"}}]},{"role":"tool","tool_call_id":'
+    b'"YY9W94ZtPLhdlX6O","content":"{\\n  \\"iso\\": \\"2026-11-06T00:00:00Z\\",\\n  \\"jd\\": 2461350.5,\\n  '
+    b'\\"mjd\\": 61350.0,\\n  \\"days_ago\\": 0.5\\n}"},{"role":"tool","tool_call_id":"Ue6nFPFaAjhwLBPR","content":'
+    b'"tool no_such_tool failed: there is no tool called no_such_tool"}],"temperature":0,"max_tokens":1024,' + LLAMACPP_TOOLS,
+)
+
+
+@pytest.fixture
+def fixed(monkeypatch):
+    """A fixed system prompt, tool list and clock, so a request's bytes can be compared."""
+    monkeypatch.setattr(a, "system_prompt", lambda context=None, vision=False: "SYSTEM")
+    monkeypatch.setattr(s, "now_jd", lambda: 2461351.0)
+
+    async def tools(self):
+        return [TOOL]
+
+    monkeypatch.setattr(a.Assistant, "tools", tools)
+
+
+async def test_the_llamacpp_request_is_unchanged(make, fixed):
+    t = make(LLAMACPP_ROUND, say("It is ", "late."))
+    evs = []
+    await t.bot.answer([{"role": "user", "content": "What time is it?"}], None, "bbml_test", evs.append)
+    assert evs[-1] == {"type": "done", "content": "It is late."}
+    assert tuple(r.content for r in t.model.requests) == LLAMACPP_BODIES
+    assert [dict(r.headers)["authorization"] for r in t.model.requests] == ["Bearer sk-model"] * 2
+
+
+FAKE_OPENROUTER_KEY = "sk-or-v1-FAKE0000000000000000000000000000000000000000000000000000"
+
+
+async def test_a_provider_gets_a_standard_body_and_its_fields_back(make, fixed):
+    # Gemini through OpenRouter: a reasoning block, then two whole calls with no index.
+    first = [
+        {"role": "assistant", "content": None,
+         "reasoning_details": [{"type": "reasoning.encrypted", "data": "ENC", "index": 0}]},
+        {"tool_calls": [{"id": "tool_1", "type": "function",
+                         "function": {"name": "convert_time", "arguments": '{"value": "2461350.5"}'},
+                         "extra_content": {"google": {"thought_signature": "SIG1"}}}]},
+        {"tool_calls": [{"id": "tool_2", "type": "function", "function": {"name": "convert_time", "arguments": "{}"},
+                         "extra_content": {"google": {"thought_signature": "SIG2"}}}]},
+    ]
+    comment = b": OPENROUTER PROCESSING\n\n"
+    usage = b'data: {"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":3}}\n\n'
+    t = make(first, lambda body: stream_bytes(comment, chunk({"content": "Done."}), usage, b"data: [DONE]\n\n"))
+    title = ("X-OpenRouter-Title", "Babamul")
+    t.bot.config.llm = a.Endpoint(
+        "http://llm.test/v1", "google/gemini-x", FAKE_OPENROUTER_KEY, kind="openai", headers=(title,)
+    )
+    evs = []
+    await t.bot.answer([{"role": "user", "content": "What time is it?"}], None, "bbml_test", evs.append)
+    assert evs[-1] == {"type": "done", "content": "Done."}
+
+    asked, again = t.model.requests
+    assert list(asked.body) == ["model", "messages", "max_tokens", "tools", "stream_options", "stream"]
+    assert asked.body["stream_options"] == {"include_usage": True} and asked.body["stream"] is True
+    assert asked.headers["authorization"] == f"Bearer {FAKE_OPENROUTER_KEY}"
+    assert asked.headers["x-openrouter-title"] == "Babamul" and asked.headers["accept"] == "text/event-stream"
+    sent = again.body["messages"][2]
+    assert sent["reasoning_details"] == first[0]["reasoning_details"]
+    signed = [(c["id"], c["extra_content"]["google"]["thought_signature"]) for c in sent["tool_calls"]]
+    assert signed == [("tool_1", "SIG1"), ("tool_2", "SIG2")]
+    assert [m["tool_call_id"] for m in again.body["messages"][3:]] == ["tool_1", "tool_2"]
+    assert FAKE_OPENROUTER_KEY not in repr(t.bot.config) and "Babamul" not in repr(t.bot.config.llm)
+
+
+# Keys never reach the logs.
+
+FAKE_KEY = "sk-ant-api03-FAKE0000000000000000000000000000000000000000000000000000"
+
+
+def test_a_key_that_cannot_go_in_a_header_is_refused_without_quoting_it():
+    with_newline = FAKE_KEY + "\nX-Injected: yes"  # stripping keeps a newline inside
+    with pytest.raises(ValueError) as failed:
+        a.Config.from_env({"ASSISTANT_LLM_URL": "http://llm.test/v1", "ASSISTANT_LLM_API_KEY": with_newline})
+    assert "ASSISTANT_LLM_API_KEY" in str(failed.value) and "FAKE" not in str(failed.value)
+    with pytest.raises(ValueError, match="ASSISTANT_FALLBACK_API_KEY"):
+        a.Config.from_env({"ASSISTANT_LLM_URL": "x", "ASSISTANT_FALLBACK_URL": "y", "ASSISTANT_FALLBACK_API_KEY": "sk FAKE"})
+
+    for key in (with_newline, FAKE_KEY + " ", "sk-café-FAKE", "sk-\x00-FAKE", "x" * 4097):
+        with pytest.raises(ValueError) as failed:
+            a.Endpoint("https://name:password@llm.test/v1?key=FAKE", "m", key)
+        message = str(failed.value)
+        assert "FAKE" not in message and "password" not in message and "x" * 20 not in message
+        assert "the API key for https://llm.test/v1 has" in message
+    for header in (("anthropic-workspace-id", "wrkspc_FAKE\nX: y"), ("Authorization", "Bearer FAKE"), ("bad name", "FAKE")):
+        with pytest.raises(ValueError) as failed:
+            a.Endpoint("https://llm.test/v1", headers=(header,))
+        assert "FAKE" not in str(failed.value)
+    with pytest.raises(ValueError, match="kind"):
+        a.Endpoint("https://llm.test/v1", kind="anthropic")
+    endpoint = a.Endpoint("https://llm.test/v1", "m", FAKE_KEY, headers=(("anthropic-workspace-id", "wrkspc_01FAKE"),))
+    assert endpoint.kind == "llamacpp" and "FAKE" not in repr(endpoint)
+
+
+async def test_a_key_that_slipped_through_is_not_sent(make, caplog):
+    t = make(say("never"))
+    object.__setattr__(t.bot.config.llm, "api_key", FAKE_KEY + "\n")  # as if built without its check
+    with caplog.at_level(logging.DEBUG):
+        response = await ask(app_of(t.bot))
+    assert response.status_code == 503 and response.json() == {"error": a.MISCONFIGURED}
+    assert t.model.requests == [] and "cannot go in a header" in caplog.text and "FAKE" not in caplog.text
+
+
+@pytest.fixture
+def http_log_levels():
+    """Puts back the levels server.main() sets on httpx's loggers."""
+    loggers = [logging.getLogger(name) for name in ("httpx", "httpcore")]
+    levels = [logger.level for logger in loggers]
+    yield
+    for logger, level in zip(loggers, levels):
+        logger.setLevel(level)
+
+
+def test_main_refuses_a_key_it_cannot_send(monkeypatch, capsys, tmp_path, http_log_levels):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASSISTANT_LLM_URL", "http://127.0.0.1:8081/v1")
+    monkeypatch.setenv("ASSISTANT_LLM_API_KEY", FAKE_KEY + "\nmore")
+    monkeypatch.setattr(sys, "argv", ["boom-mcp", "--http", "--assistant", "--no-examples"])
+    monkeypatch.setattr(server.uvicorn, "run", lambda app, **kwargs: pytest.fail("started with a key it cannot send"))
+    with pytest.raises(SystemExit):
+        server.main()
+    error = capsys.readouterr().err
+    assert "ASSISTANT_LLM_API_KEY has spaces, line breaks or characters outside ASCII" in error and "FAKE" not in error
+
+
+async def test_a_transport_error_is_logged_by_its_type_only(fake, monkeypatch, caplog, http_log_levels):
+    """A real socket, so the error is h11's own. A key ending in a newline, let
+    through on purpose here, makes h11 refuse the header and quote it whole."""
+
+    async def hang_up(reader, writer):
+        await reader.read(100)
+        writer.close()
+
+    listening, url = await socket_model(hang_up)
+    key = FAKE_KEY + "\n"
+    monkeypatch.setattr(a, "API_KEY", re.compile(r"(?s).+"))  # no check in front of h11
+    server.quiet_http_logs()  # as server.main() does
+    mounts = {"all://": httpx.MockTransport(fake), url.removesuffix("/v1"): httpx.AsyncHTTPTransport()}
+    try:
+        async with httpx.AsyncClient(mounts=mounts) as http:
+            with pytest.raises(httpx.LocalProtocolError) as raw:
+                await http.post(f"{url}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json={})
+            assert FAKE_KEY in repr(raw.value)  # what round() used to keep, and run() to log
+
+            bot = a.Assistant(a.Config(llm=a.Endpoint(url, "m", key)), http=http)
+            with caplog.at_level(logging.DEBUG):
+                response = await ask(app_of(bot))
+                assert response.status_code == 503 and response.json() == {"error": a.UNREACHABLE}
+                with pytest.raises(a.ModelError) as failed:
+                    await bot.answer([{"role": "user", "content": "hi"}], None, "bbml_test", [].append)
+    finally:
+        listening.close()
+    assert str(failed.value) == "LocalProtocolError" and failed.value.message == a.UNREACHABLE
+    assert "FAKE" not in "".join(traceback.format_exception(failed.value))
+    assert "failed: LocalProtocolError" in caplog.text and "model failed for user user-1: LocalProtocolError" in caplog.text
+    assert not [r for r in caplog.records if "FAKE" in r.getMessage() or "FAKE" in (r.exc_text or "")]
+
+
+async def test_a_refused_request_is_logged_by_its_error_type_and_code(make, caplog):
+    echoed = f"invalid x-api-key: {FAKE_KEY}"
+    anthropic = {"type": "error", "error": {"type": "authentication_error", "message": echoed}}
+    openai = {"error": {"message": echoed, "type": "invalid_request_error", "param": None, "code": "invalid_api_key"}}
+    for reply, logged in (
+        (httpx.Response(401, json=anthropic), "refused the request: 401 type authentication_error ("),
+        (httpx.Response(401, json=openai), "refused the request: 401 type invalid_request_error, code invalid_api_key ("),
+        (httpx.Response(401, text=echoed), "refused the request: 401 no error type ("),
+        (httpx.Response(403, json={"error": {"type": echoed, "code": [echoed]}}), "refused the request: 403 no error type ("),
+    ):
+        t = make(reply)
+        with caplog.at_level(logging.DEBUG):
+            response = await ask(app_of(t.bot))
+        assert response.status_code == 503 and response.json() == {"error": a.MISCONFIGURED}
+        assert logged in caplog.text
+        assert "FAKE" not in caplog.text and "sk-model" not in caplog.text
+        caplog.clear()
+
+    # Errors partway through a reply: llama.cpp's own form, and one in a chunk.
+    for broken, logged in (
+        (b'error: {"code": 500, "message": "out of memory, ' + FAKE_KEY.encode() + b'"}\n\n', "code 500"),
+        (b'data: {"error": {"message": "' + FAKE_KEY.encode() + b'", "code": 502}}\n\n', "code 502"),
+    ):
+        t = make(lambda body, broken=broken: stream_bytes(chunk({"content": "It is"}), broken, b"data: [DONE]\n\n"))
+        with caplog.at_level(logging.DEBUG):
+            evs = events(await ask(app_of(t.bot)))
+        assert evs[-1] == {"type": "error", "message": a.STALLED}
+        assert f"model failed for user user-1: {logged}" in caplog.text and "FAKE" not in caplog.text
+        caplog.clear()
+
+    assert a.error_fields(b"[" * 100_000) == "no error type"
+    assert a.error_fields({"error": {"type": "overloaded_error", "code": True}}) == "type overloaded_error"
+
+
+def test_logged_urls_hold_no_credentials():
+    assert a.shown_url("https://name:FAKE@llm.example.org:8443/v1?api-key=FAKE#x") == "https://llm.example.org:8443/v1"
+    assert a.shown_url("http://127.0.0.1:8081/v1") == "http://127.0.0.1:8081/v1"
+    assert a.shown_url("http://[::1") == "(a URL that does not parse)"
+
+
 # Starting the server.
 
 
@@ -1130,7 +1442,7 @@ def test_host_warning():
     assert host_warning(args) is None
 
 
-def test_main_warns_and_bounds_the_shutdown(monkeypatch, caplog, tmp_path):
+def test_main_warns_and_bounds_the_shutdown(monkeypatch, caplog, tmp_path, http_log_levels):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ASSISTANT_ENABLED", raising=False)
     monkeypatch.setitem(settings, "require_client_token", False)
@@ -1141,6 +1453,8 @@ def test_main_warns_and_bounds_the_shutdown(monkeypatch, caplog, tmp_path):
         server.main()
     assert ran["host"] == "127.0.0.1" and ran["timeout_graceful_shutdown"] == server.SHUTDOWN_GRACE
     assert any("answers 421" in r.getMessage() for r in caplog.records)
+    # httpx logs each request and httpcore each step of it, failures quoted whole.
+    assert logging.getLogger("httpx").level == logging.getLogger("httpcore").level == logging.WARNING
 
 
 def test_now_line_names_last_nights_dates():
